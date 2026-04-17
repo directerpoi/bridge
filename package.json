@@ -1,0 +1,43 @@
+{
+  "name": "@anthropic/bridge",
+  "version": "1.0.0",
+  "description": "A powerful, secure, and lightning-fast HTTP client for Node.js and browsers. Axios-compatible API with zero dependencies.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "jest --verbose --forceExit",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "http",
+    "https",
+    "request",
+    "client",
+    "ajax",
+    "fetch",
+    "bridge",
+    "axios",
+    "fast",
+    "secure",
+    "lightweight"
+  ],
+  "author": "bridge contributors",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
