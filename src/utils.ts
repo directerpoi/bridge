@@ -1,7 +1,7 @@
 import { BridgeRequestConfig } from './types';
 
 /**
- * Serialises params into a query string.
+ * Serializes params into a query string.
  */
 export function serializeParams(params: Record<string, unknown> | URLSearchParams | undefined): string {
   if (!params) return '';

@@ -84,7 +84,7 @@ export function validateURL(
 }
 
 /**
- * Sanitises headers: removes forbidden headers and ensures values are strings.
+ * Sanitizes headers: removes forbidden headers and ensures values are strings.
  */
 export function sanitizeHeaders(
   headers: Record<string, string | number | boolean> | undefined
