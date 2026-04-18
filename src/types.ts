@@ -11,6 +11,44 @@ export type Method =
 
 export type ResponseType = 'arraybuffer' | 'json' | 'text' | 'stream';
 
+export interface RetryConfig {
+  /** Maximum number of retry attempts (default: 3) */
+  retries: number;
+  /** Initial delay in ms before first retry (default: 300) */
+  delay: number;
+  /** Maximum delay in ms between retries (default: 10000) */
+  maxDelay: number;
+  /** Backoff multiplier (default: 2) */
+  backoffFactor: number;
+  /** Which HTTP methods to retry (default: GET, HEAD, OPTIONS, PUT, DELETE) */
+  retryableMethods: Method[];
+  /** Which HTTP status codes to retry (default: 408, 429, 500, 502, 503, 504) */
+  retryableStatuses: number[];
+  /** Custom condition for retry — return true to retry */
+  retryCondition?: (error: BridgeError) => boolean;
+}
+
+export interface TLSConfig {
+  /** Reject connections with unverified certificates (default: true) */
+  rejectUnauthorized?: boolean;
+  /** Custom Certificate Authority certificates (PEM format) */
+  ca?: string | Buffer | Array<string | Buffer>;
+  /** Client certificate (PEM format) for mTLS */
+  cert?: string | Buffer | Array<string | Buffer>;
+  /** Client private key (PEM format) for mTLS */
+  key?: string | Buffer;
+  /** PFX/PKCS12 certificate bundle */
+  pfx?: string | Buffer;
+  /** Passphrase for the private key or PFX */
+  passphrase?: string;
+  /** Minimum TLS version (default: 'TLSv1.2') */
+  minVersion?: 'TLSv1.2' | 'TLSv1.3';
+  /** Allowed cipher suites */
+  ciphers?: string;
+  /** Expected server certificate fingerprint (SHA-256 pin for certificate pinning) */
+  certFingerprint?: string;
+}
+
 export interface BridgeRequestConfig {
   url?: string;
   method?: Method;
@@ -19,6 +57,8 @@ export interface BridgeRequestConfig {
   params?: Record<string, unknown> | URLSearchParams;
   data?: unknown;
   timeout?: number;
+  /** Separate timeout for the response body to be fully received (ms) */
+  responseTimeout?: number;
   responseType?: ResponseType;
   maxContentLength?: number;
   maxBodyLength?: number;
@@ -34,6 +74,27 @@ export interface BridgeRequestConfig {
   // Security options
   allowPrivateNetworks?: boolean;
   maxHeaderSize?: number;
+  /** Enforce HTTPS — reject all non-HTTPS requests */
+  enforceHttps?: boolean;
+  /** Enable DNS-based SSRF protection (resolves hostname and validates IP before connecting) */
+  dnsProtection?: boolean;
+
+  // Retry options
+  /** Enable automatic retry with exponential backoff. Pass true for defaults or a RetryConfig. */
+  retry?: boolean | Partial<RetryConfig>;
+
+  // TLS/SSL options
+  tls?: TLSConfig;
+
+  // Transformers
+  /** Transform request data before sending */
+  transformRequest?: Array<(data: unknown, headers: Record<string, string>) => unknown>;
+  /** Transform response data after receiving */
+  transformResponse?: Array<(data: unknown) => unknown>;
+
+  // Observability
+  /** Enable automatic X-Request-ID header injection */
+  requestId?: boolean | string;
 }
 
 export interface BridgeResponse<T = unknown> {

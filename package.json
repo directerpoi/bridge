@@ -1,7 +1,7 @@
 {
   "name": "@anthropic/bridge",
-  "version": "2.0.0",
-  "description": "A powerful, secure, and lightning-fast HTTP client for Node.js and browsers. Axios-compatible API with zero dependencies.",
+  "version": "3.0.0",
+  "description": "A powerful, secure, and lightning-fast HTTP client for Node.js and browsers. Axios-compatible API with zero dependencies, automatic retry, TLS/mTLS, certificate pinning, and enterprise-grade security.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -26,7 +26,14 @@
     "axios",
     "fast",
     "secure",
-    "lightweight"
+    "lightweight",
+    "retry",
+    "tls",
+    "mtls",
+    "certificate-pinning",
+    "encryption",
+    "ssrf",
+    "security"
   ],
   "author": "bridge contributors",
   "license": "MIT",

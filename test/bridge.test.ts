@@ -21,6 +21,7 @@ interface EchoData {
 
 let server: http.Server;
 let baseURL: string;
+const flakyCounters: Record<string, number> = {};
 
 function createTestServer(): Promise<void> {
   return new Promise((resolve) => {
@@ -107,6 +108,43 @@ function createTestServer(): Promise<void> {
         if (pathname === '/no-content') {
           res.writeHead(204);
           res.end();
+          return;
+        }
+
+        // Route: intermittent failure (fails N times then succeeds)
+        if (pathname === '/flaky') {
+          const failCount = parseInt(url.searchParams.get('fail') || '2', 10);
+          const key = url.searchParams.get('key') || 'default';
+          if (!flakyCounters[key]) flakyCounters[key] = 0;
+          flakyCounters[key]++;
+          if (flakyCounters[key] <= failCount) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Service Unavailable', attempt: flakyCounters[key] }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true, attempts: flakyCounters[key] }));
+            flakyCounters[key] = 0; // Reset for next test
+          }
+          return;
+        }
+
+        // Route: slow body (starts responding then delays)
+        if (pathname === '/slow-body') {
+          const ms = parseInt(url.searchParams.get('ms') || '2000', 10);
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.write('start...');
+          setTimeout(() => {
+            if (!res.writableEnded) {
+              res.end('...done');
+            }
+          }, ms);
+          return;
+        }
+
+        // Route: return request headers back (for testing request ID, etc.)
+        if (pathname === '/headers') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ headers: req.headers }));
           return;
         }
 
@@ -659,6 +697,286 @@ describe('bridge', () => {
           expect(err.code).toBe('ERR_BODY_TOO_LARGE');
         }
       }
+    });
+  });
+
+  // ─── Retry with Exponential Backoff ─────────────────────────────────────
+
+  describe('retry', () => {
+    it('should retry failed requests and eventually succeed', async () => {
+      const key = `retry-test-${Date.now()}`;
+      const res = await client.get(`${baseURL}/flaky?fail=2&key=${key}`, {
+        retry: { retries: 3, delay: 50, maxDelay: 200, backoffFactor: 2, retryableMethods: ['GET'], retryableStatuses: [503] },
+        allowPrivateNetworks: true,
+      });
+      expect(res.status).toBe(200);
+      expect((res.data as { success: boolean }).success).toBe(true);
+    });
+
+    it('should use default retry config when retry is true', async () => {
+      const key = `retry-default-${Date.now()}`;
+      const res = await client.get(`${baseURL}/flaky?fail=1&key=${key}`, {
+        retry: true,
+        allowPrivateNetworks: true,
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it('should fail when all retries are exhausted', async () => {
+      const key = `retry-exhaust-${Date.now()}`;
+      try {
+        await client.get(`${baseURL}/flaky?fail=10&key=${key}`, {
+          retry: { retries: 2, delay: 50, maxDelay: 100, backoffFactor: 2, retryableMethods: ['GET'], retryableStatuses: [503] },
+          allowPrivateNetworks: true,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+      }
+    });
+
+    it('should not retry non-retryable methods', async () => {
+      const key = `retry-post-${Date.now()}`;
+      try {
+        await client.post(`${baseURL}/flaky?fail=2&key=${key}`, {}, {
+          retry: { retries: 3, delay: 50, maxDelay: 100, backoffFactor: 2, retryableMethods: ['GET'], retryableStatuses: [503] },
+          allowPrivateNetworks: true,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+      }
+    });
+
+    it('should support custom retry condition', async () => {
+      const key = `retry-custom-${Date.now()}`;
+      const res = await client.get(`${baseURL}/flaky?fail=1&key=${key}`, {
+        retry: {
+          retries: 3,
+          delay: 50,
+          maxDelay: 100,
+          backoffFactor: 2,
+          retryableMethods: ['GET'],
+          retryableStatuses: [503],
+          retryCondition: (error) => error.response?.status === 503,
+        },
+        allowPrivateNetworks: true,
+      });
+      expect(res.status).toBe(200);
+    });
+  });
+
+  // ─── Request ID ───────────────────────────────────────────────────────────
+
+  describe('request ID', () => {
+    it('should inject X-Request-ID when requestId is true', async () => {
+      const res = await client.get<{ headers: Record<string, string> }>(`${baseURL}/headers`, {
+        requestId: true,
+        allowPrivateNetworks: true,
+      });
+      expect(res.data.headers['x-request-id']).toBeDefined();
+      // UUID v4 format
+      expect(res.data.headers['x-request-id']).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      );
+    });
+
+    it('should inject custom request ID when requestId is a string', async () => {
+      const customId = 'my-custom-request-id-123';
+      const res = await client.get<{ headers: Record<string, string> }>(`${baseURL}/headers`, {
+        requestId: customId,
+        allowPrivateNetworks: true,
+      });
+      expect(res.data.headers['x-request-id']).toBe(customId);
+    });
+
+    it('should not inject request ID when requestId is not set', async () => {
+      const res = await client.get<{ headers: Record<string, string> }>(`${baseURL}/headers`, {
+        allowPrivateNetworks: true,
+      });
+      expect(res.data.headers['x-request-id']).toBeUndefined();
+    });
+  });
+
+  // ─── Request/Response Transformers ────────────────────────────────────────
+
+  describe('transformers', () => {
+    it('should apply transformRequest to request data', async () => {
+      const res = await client.post<EchoData>(`${baseURL}/echo`, { foo: 'bar' }, {
+        allowPrivateNetworks: true,
+        transformRequest: [
+          (data, headers) => {
+            headers['Content-Type'] = 'application/json';
+            return JSON.stringify({ ...(data as object), extra: 'added' });
+          },
+        ],
+      });
+      expect(res.status).toBe(200);
+      const body = JSON.parse(res.data.body || '{}');
+      expect(body.extra).toBe('added');
+    });
+
+    it('should apply transformResponse to response data', async () => {
+      const res = await client.get<{ method: string; transformed: boolean }>(`${baseURL}/echo`, {
+        allowPrivateNetworks: true,
+        transformResponse: [
+          (data) => ({
+            ...(data as object),
+            transformed: true,
+          }),
+        ],
+      });
+      expect(res.data.transformed).toBe(true);
+      expect(res.data.method).toBe('GET');
+    });
+
+    it('should chain multiple transformers', async () => {
+      const res = await client.get<{ step1: boolean; step2: boolean }>(`${baseURL}/echo`, {
+        allowPrivateNetworks: true,
+        transformResponse: [
+          (data) => ({ ...(data as object), step1: true }),
+          (data) => ({ ...(data as object), step2: true }),
+        ],
+      });
+      expect(res.data.step1).toBe(true);
+      expect(res.data.step2).toBe(true);
+    });
+  });
+
+  // ─── HTTPS Enforcement ────────────────────────────────────────────────────
+
+  describe('HTTPS enforcement', () => {
+    it('should block HTTP requests when enforceHttps is true', async () => {
+      try {
+        await bridge.get('http://example.com', {
+          enforceHttps: true,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.message).toContain('HTTPS is enforced');
+        }
+      }
+    });
+  });
+
+  // ─── Enhanced Header Sanitization ─────────────────────────────────────────
+
+  describe('enhanced security', () => {
+    it('should block header injection via newline characters', async () => {
+      try {
+        await client.get(`${baseURL}/echo`, {
+          headers: {
+            'X-Custom': 'value\r\nInjected-Header: evil',
+          },
+          allowPrivateNetworks: true,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.message).toContain('Header injection');
+        }
+      }
+    });
+
+    it('should block header injection via null byte', async () => {
+      try {
+        await client.get(`${baseURL}/echo`, {
+          headers: {
+            'X-Custom': 'value\x00evil',
+          },
+          allowPrivateNetworks: true,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.message).toContain('Header injection');
+        }
+      }
+    });
+
+    it('should strip additional dangerous headers', async () => {
+      const res = await client.get<EchoData>(`${baseURL}/echo`, {
+        headers: {
+          'Host': 'evil.com',
+          'Connection': 'keep-alive',
+          'Transfer-Encoding': 'chunked',
+          'Upgrade': 'websocket',
+          'X-Safe-Header': 'value',
+        },
+        allowPrivateNetworks: true,
+      });
+      expect(res.data.headers['x-safe-header']).toBe('value');
+      // These should be stripped or overridden by Node.js
+      expect(res.data.headers['upgrade']).toBeUndefined();
+      expect(res.data.headers['transfer-encoding']).toBeUndefined();
+    });
+
+    it('should block URLs with embedded credentials', async () => {
+      try {
+        await bridge.get('http://user:pass@example.com/path');
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.message).toContain('embedded credentials');
+        }
+      }
+    });
+  });
+
+  // ─── Response Timeout ─────────────────────────────────────────────────────
+
+  describe('response timeout', () => {
+    it('should timeout on slow body download', async () => {
+      try {
+        await client.get(`${baseURL}/slow-body?ms=5000`, {
+          responseTimeout: 100,
+          allowPrivateNetworks: true,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_RESPONSE_TIMEOUT');
+        }
+      }
+    });
+  });
+
+  // ─── TLS Config Types ────────────────────────────────────────────────────
+
+  describe('TLS configuration', () => {
+    it('should accept TLS configuration options', async () => {
+      // This test validates that TLS config is accepted without error
+      // (actual TLS verification requires an HTTPS server)
+      const instance = bridge.create({
+        allowPrivateNetworks: true,
+        tls: {
+          rejectUnauthorized: true,
+          minVersion: 'TLSv1.2',
+          ciphers: 'ECDHE-ECDSA-AES128-GCM-SHA256',
+        },
+      });
+      // Make a simple HTTP request (TLS config is only applied to HTTPS)
+      const res = await instance.get<EchoData>(`${baseURL}/echo`);
+      expect(res.status).toBe(200);
+    });
+  });
+
+  // ─── DNS Protection ──────────────────────────────────────────────────────
+
+  describe('DNS protection', () => {
+    it('should accept dnsProtection option', async () => {
+      // DNS protection on loopback should work when allowPrivateNetworks is true
+      const res = await client.get<EchoData>(`${baseURL}/echo`, {
+        dnsProtection: true,
+        allowPrivateNetworks: true,
+      });
+      expect(res.status).toBe(200);
     });
   });
 });

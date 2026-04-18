@@ -11,6 +11,8 @@ import {
   ResponseType,
   CancelTokenSource,
   InterceptorManager,
+  RetryConfig,
+  TLSConfig,
 } from './types';
 
 // ─── Create Default Instance ───────────────────────────────────────────────────
@@ -18,7 +20,7 @@ import {
 const bridge = createBridgeInstance({
   headers: {
     'Accept': 'application/json, text/plain, */*',
-    'User-Agent': 'bridge/2.0.0',
+    'User-Agent': 'bridge/3.0.0',
   },
   timeout: 0,
   responseType: 'json',
@@ -66,6 +68,8 @@ export type {
   ResponseType,
   CancelTokenSource,
   InterceptorManager,
+  RetryConfig,
+  TLSConfig,
 };
 
 // CommonJS compatibility
