@@ -69,6 +69,7 @@ export class CircuitBreaker {
 
     if (newState === 'half-open') {
       this.successCount = 0;
+      this.failureCount = 0;
     }
 
     if (this.config.onStateChange) {

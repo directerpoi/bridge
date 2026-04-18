@@ -1008,7 +1008,7 @@ describe('bridge', () => {
       const instance = client.create({ baseURL });
       instance.setRateLimiter({ maxRequests: 1, windowMs: 5000 });
       // Now disable it
-      instance.setRateLimiter(false as unknown as boolean);
+      instance.setRateLimiter(false);
 
       const start = Date.now();
       await instance.get('/echo');

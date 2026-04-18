@@ -32,9 +32,13 @@ export class Bridge {
   }
 
   /**
-   * Set a rate limiter on this instance.
+   * Set a rate limiter on this instance. Pass false to disable.
    */
   setRateLimiter(config: boolean | Partial<RateLimitConfig>): void {
+    if (config === false) {
+      this.rateLimiter = null;
+      return;
+    }
     const resolved = resolveRateLimitConfig(config);
     this.rateLimiter = resolved ? new RateLimiter(resolved) : null;
   }

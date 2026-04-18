@@ -16,6 +16,7 @@ const DEFAULT_MAX_REDIRECTS = 5;
 const DEFAULT_TIMEOUT = 0; // no timeout
 const DEFAULT_MAX_CONTENT_LENGTH = 50 * 1024 * 1024; // 50 MB
 const DEFAULT_MAX_BODY_LENGTH = 50 * 1024 * 1024;    // 50 MB
+const MAX_PROGRESS_EVENTS = 100; // Maximum number of progress events during upload
 
 // ─── Adapter ───────────────────────────────────────────────────────────────────
 
@@ -586,7 +587,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
               ? Buffer.from(requestData)
               : requestData;
             const totalSize = dataBuffer.length;
-            const chunkSize = Math.max(1024, Math.ceil(totalSize / 100)); // ~100 progress events max
+            const chunkSize = Math.max(1024, Math.ceil(totalSize / MAX_PROGRESS_EVENTS));
             let bytesSent = 0;
             const uploadStartTime = Date.now();
 
