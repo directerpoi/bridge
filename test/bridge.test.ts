@@ -148,6 +148,22 @@ function createTestServer(): Promise<void> {
           return;
         }
 
+        // Route: redirect to an external URL (for testing cross-origin redirect header stripping)
+        if (pathname === '/redirect-external') {
+          const target = url.searchParams.get('to') || 'http://example.com/';
+          const statusCode = parseInt(url.searchParams.get('status') || '302', 10);
+          res.writeHead(statusCode, { Location: target });
+          res.end();
+          return;
+        }
+
+        // Route: redirect to a different path on same server, echoing headers (for testing same-origin redirect)
+        if (pathname === '/redirect-with-headers') {
+          res.writeHead(302, { Location: '/headers' });
+          res.end();
+          return;
+        }
+
         // Default 404
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Not found' }));
@@ -1401,6 +1417,376 @@ describe('bridge', () => {
       resolve1();
       await task1;
       expect(manager.getRunning()).toBe(0);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ─── v5.0.0 Security Features ─────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ─── Domain Allowlist ──────────────────────────────────────────────────────
+
+  describe('domain allowlist', () => {
+    it('should allow requests to domains in the allowlist', async () => {
+      const instance = client.create({
+        allowedDomains: ['127.0.0.1'],
+        allowPrivateNetworks: true,
+      });
+      const res = await instance.get(`${baseURL}/echo`);
+      expect(res.status).toBe(200);
+    });
+
+    it('should block requests to domains NOT in the allowlist', async () => {
+      try {
+        const instance = bridge.create({
+          allowedDomains: ['api.example.com'],
+          allowPrivateNetworks: true,
+        });
+        await instance.get(`${baseURL}/echo`);
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_DOMAIN_BLOCKED');
+          expect(err.message).toContain('not in the domain allowlist');
+        }
+      }
+    });
+
+    it('should support wildcard subdomain patterns in allowlist', async () => {
+      try {
+        const instance = bridge.create({
+          allowedDomains: ['*.example.com'],
+          allowPrivateNetworks: true,
+        });
+        await instance.get('http://api.example.com/path');
+        // This will fail with a network error since example.com doesn't exist,
+        // but it should NOT fail with ERR_DOMAIN_BLOCKED
+        fail('Should have thrown a network error');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).not.toBe('ERR_DOMAIN_BLOCKED');
+        }
+      }
+    });
+  });
+
+  // ─── Domain Blocklist ──────────────────────────────────────────────────────
+
+  describe('domain blocklist', () => {
+    it('should block requests to domains in the blocklist', async () => {
+      try {
+        const instance = bridge.create({
+          blockedDomains: ['127.0.0.1'],
+          allowPrivateNetworks: true,
+        });
+        await instance.get(`${baseURL}/echo`);
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_DOMAIN_BLOCKED');
+          expect(err.message).toContain('blocked by the domain blocklist');
+        }
+      }
+    });
+
+    it('should allow requests to domains NOT in the blocklist', async () => {
+      const instance = client.create({
+        blockedDomains: ['evil.com', 'bad-actor.net'],
+        allowPrivateNetworks: true,
+      });
+      const res = await instance.get(`${baseURL}/echo`);
+      expect(res.status).toBe(200);
+    });
+
+    it('should support wildcard subdomain patterns in blocklist', async () => {
+      try {
+        const instance = bridge.create({
+          blockedDomains: ['*.evil.com'],
+          allowPrivateNetworks: true,
+        });
+        await instance.get('http://sub.evil.com/path');
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_DOMAIN_BLOCKED');
+        }
+      }
+    });
+
+    it('should block base domain when wildcard pattern is used', async () => {
+      try {
+        const instance = bridge.create({
+          blockedDomains: ['*.evil.com'],
+          allowPrivateNetworks: true,
+        });
+        await instance.get('http://evil.com/path');
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_DOMAIN_BLOCKED');
+        }
+      }
+    });
+
+    it('should apply blocklist before allowlist', async () => {
+      // When a domain is in both blocklist and allowlist, blocklist wins
+      try {
+        const instance = bridge.create({
+          allowedDomains: ['127.0.0.1'],
+          blockedDomains: ['127.0.0.1'],
+          allowPrivateNetworks: true,
+        });
+        await instance.get(`${baseURL}/echo`);
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_DOMAIN_BLOCKED');
+          expect(err.message).toContain('blocked by the domain blocklist');
+        }
+      }
+    });
+  });
+
+  // ─── Sensitive Header Stripping on Cross-Origin Redirects ──────────────────
+
+  describe('sensitive header stripping on cross-origin redirects', () => {
+    it('should preserve sensitive headers on same-origin redirects', async () => {
+      const res = await client.get<{ headers: Record<string, string> }>(`${baseURL}/redirect-with-headers`, {
+        headers: {
+          'Authorization': 'Bearer secret-token-123',
+          'X-Custom': 'stays',
+        },
+        allowPrivateNetworks: true,
+      });
+      expect(res.status).toBe(200);
+      expect(res.data.headers['authorization']).toBe('Bearer secret-token-123');
+      expect(res.data.headers['x-custom']).toBe('stays');
+    });
+
+    it('should strip sensitive headers on cross-origin redirects by default', async () => {
+      // Redirect to a different origin — we test by redirecting to the same server
+      // but on a different port to simulate cross-origin. Since we can't actually
+      // do that easily, we test the security module directly.
+      const { stripSensitiveHeaders } = require('../src/security');
+      const headers = {
+        'Authorization': 'Bearer secret',
+        'Cookie': 'session=abc123',
+        'Proxy-Authorization': 'Basic creds',
+        'X-Custom': 'keep-me',
+        'Content-Type': 'application/json',
+      };
+      const stripped = stripSensitiveHeaders(headers);
+      expect(stripped['Authorization']).toBeUndefined();
+      expect(stripped['Cookie']).toBeUndefined();
+      expect(stripped['Proxy-Authorization']).toBeUndefined();
+      expect(stripped['X-Custom']).toBe('keep-me');
+      expect(stripped['Content-Type']).toBe('application/json');
+    });
+
+    it('should detect cross-origin correctly', () => {
+      const { isSameOrigin } = require('../src/security');
+      const URL = require('url').URL;
+
+      // Same origin
+      expect(isSameOrigin(
+        new URL('http://example.com/a'),
+        new URL('http://example.com/b')
+      )).toBe(true);
+
+      // Different hostname
+      expect(isSameOrigin(
+        new URL('http://example.com/a'),
+        new URL('http://other.com/b')
+      )).toBe(false);
+
+      // Different protocol
+      expect(isSameOrigin(
+        new URL('https://example.com/a'),
+        new URL('http://example.com/b')
+      )).toBe(false);
+
+      // Different port
+      expect(isSameOrigin(
+        new URL('http://example.com:3000/a'),
+        new URL('http://example.com:4000/b')
+      )).toBe(false);
+
+      // Same origin with port
+      expect(isSameOrigin(
+        new URL('http://example.com:3000/a'),
+        new URL('http://example.com:3000/b')
+      )).toBe(true);
+    });
+
+    it('should allow disabling sensitive header stripping', () => {
+      // stripSensitiveHeadersOnRedirect: false should preserve headers
+      // This is a config option test — ensuring the option is accepted
+      const instance = client.create({
+        stripSensitiveHeadersOnRedirect: false,
+        allowPrivateNetworks: true,
+      });
+      expect(instance.defaults.stripSensitiveHeadersOnRedirect).toBe(false);
+    });
+  });
+
+  // ─── HTTPS Downgrade Protection ────────────────────────────────────────────
+
+  describe('HTTPS downgrade protection', () => {
+    it('should block HTTPS to HTTP downgrade by default', () => {
+      const { checkHttpsDowngrade } = require('../src/security');
+      const URL = require('url').URL;
+
+      expect(() => {
+        checkHttpsDowngrade(
+          new URL('https://example.com/a'),
+          new URL('http://example.com/b'),
+          false
+        );
+      }).toThrow('Redirect from HTTPS to HTTP is blocked');
+    });
+
+    it('should allow HTTPS to HTTP downgrade when explicitly permitted', () => {
+      const { checkHttpsDowngrade } = require('../src/security');
+      const URL = require('url').URL;
+
+      expect(() => {
+        checkHttpsDowngrade(
+          new URL('https://example.com/a'),
+          new URL('http://example.com/b'),
+          true
+        );
+      }).not.toThrow();
+    });
+
+    it('should allow HTTP to HTTPS upgrade on redirects', () => {
+      const { checkHttpsDowngrade } = require('../src/security');
+      const URL = require('url').URL;
+
+      expect(() => {
+        checkHttpsDowngrade(
+          new URL('http://example.com/a'),
+          new URL('https://example.com/b'),
+          false
+        );
+      }).not.toThrow();
+    });
+
+    it('should allow same-protocol redirects', () => {
+      const { checkHttpsDowngrade } = require('../src/security');
+      const URL = require('url').URL;
+
+      expect(() => {
+        checkHttpsDowngrade(
+          new URL('http://example.com/a'),
+          new URL('http://example.com/b'),
+          false
+        );
+      }).not.toThrow();
+
+      expect(() => {
+        checkHttpsDowngrade(
+          new URL('https://example.com/a'),
+          new URL('https://example.com/b'),
+          false
+        );
+      }).not.toThrow();
+    });
+  });
+
+  // ─── Domain Validation Unit Tests ──────────────────────────────────────────
+
+  describe('domain validation (unit)', () => {
+    it('should match exact domains', () => {
+      const { validateDomain } = require('../src/security');
+
+      // Allowed exact match
+      expect(() => validateDomain('example.com', ['example.com'])).not.toThrow();
+
+      // Not in allowlist
+      expect(() => validateDomain('other.com', ['example.com'])).toThrow('not in the domain allowlist');
+    });
+
+    it('should match wildcard subdomain patterns', () => {
+      const { validateDomain } = require('../src/security');
+
+      // Wildcard match
+      expect(() => validateDomain('api.example.com', ['*.example.com'])).not.toThrow();
+      expect(() => validateDomain('sub.api.example.com', ['*.example.com'])).not.toThrow();
+      expect(() => validateDomain('example.com', ['*.example.com'])).not.toThrow();
+
+      // Non-match
+      expect(() => validateDomain('other.com', ['*.example.com'])).toThrow('not in the domain allowlist');
+    });
+
+    it('should be case insensitive', () => {
+      const { validateDomain } = require('../src/security');
+
+      expect(() => validateDomain('Example.COM', ['example.com'])).not.toThrow();
+      expect(() => validateDomain('example.com', ['Example.COM'])).not.toThrow();
+    });
+
+    it('should handle empty allowlist/blocklist gracefully', () => {
+      const { validateDomain } = require('../src/security');
+
+      // Empty or undefined lists should not block anything
+      expect(() => validateDomain('example.com', [], [])).not.toThrow();
+      expect(() => validateDomain('example.com', undefined, undefined)).not.toThrow();
+    });
+
+    it('should prioritize blocklist over allowlist', () => {
+      const { validateDomain } = require('../src/security');
+
+      // Domain in both lists — blocklist should win
+      expect(() => validateDomain('example.com', ['example.com'], ['example.com']))
+        .toThrow('blocked by the domain blocklist');
+    });
+  });
+
+  // ─── v5.0.0 Integration Tests ─────────────────────────────────────────────
+
+  describe('v5.0.0 domain validation on redirects', () => {
+    it('should block redirects to blocked domains', async () => {
+      try {
+        const instance = bridge.create({
+          blockedDomains: ['example.com'],
+          allowPrivateNetworks: true,
+        });
+        // This redirect target goes to example.com which is blocked
+        await instance.get(`${baseURL}/redirect-external?to=http://example.com/`, {
+          allowPrivateNetworks: true,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_DOMAIN_BLOCKED');
+        }
+      }
+    });
+
+    it('should block redirects to domains NOT in the allowlist', async () => {
+      try {
+        const instance = bridge.create({
+          allowedDomains: ['127.0.0.1'],
+          allowPrivateNetworks: true,
+        });
+        // This redirect target goes to example.com which is not in allowlist
+        await instance.get(`${baseURL}/redirect-external?to=http://example.com/`, {
+          allowPrivateNetworks: true,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_DOMAIN_BLOCKED');
+        }
+      }
     });
   });
 });
