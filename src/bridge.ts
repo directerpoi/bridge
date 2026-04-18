@@ -1,11 +1,16 @@
-import { BridgeRequestConfig, BridgeResponse, BridgeInstance, InterceptorHandler } from './types';
+import { BridgeRequestConfig, BridgeResponse, BridgeInstance, InterceptorHandler, RateLimitConfig, CircuitBreakerConfig, ConcurrencyConfig } from './types';
 import { InterceptorManager } from './interceptors';
 import { httpAdapter } from './adapter';
 import { mergeConfig, buildFullURL } from './utils';
+import { RateLimiter, resolveRateLimitConfig } from './ratelimit';
+import { CircuitBreaker, resolveCircuitBreakerConfig, CircuitState } from './circuit-breaker';
+import { ConcurrencyManager, resolveConcurrencyConfig } from './concurrency';
+import { createError } from './error';
 
 /**
  * The Bridge HTTP client class.
  * API-compatible with axios — supports interceptors, defaults, and convenience methods.
+ * v4.0.0: Adds rate limiting, circuit breaker, concurrency control, progress events, timeline, and hooks.
  */
 export class Bridge {
   defaults: BridgeRequestConfig;
@@ -13,6 +18,10 @@ export class Bridge {
     request: InterceptorManager<BridgeRequestConfig>;
     response: InterceptorManager<BridgeResponse>;
   };
+
+  private rateLimiter: RateLimiter | null = null;
+  private circuitBreaker: CircuitBreaker | null = null;
+  private concurrencyManager: ConcurrencyManager | null = null;
 
   constructor(instanceConfig: BridgeRequestConfig = {}) {
     this.defaults = instanceConfig;
@@ -23,7 +32,43 @@ export class Bridge {
   }
 
   /**
+   * Set a rate limiter on this instance. Pass false to disable.
+   */
+  setRateLimiter(config: boolean | Partial<RateLimitConfig>): void {
+    if (config === false) {
+      this.rateLimiter = null;
+      return;
+    }
+    const resolved = resolveRateLimitConfig(config);
+    this.rateLimiter = resolved ? new RateLimiter(resolved) : null;
+  }
+
+  /**
+   * Set a circuit breaker on this instance.
+   */
+  setCircuitBreaker(config: boolean | Partial<CircuitBreakerConfig>): void {
+    const resolved = resolveCircuitBreakerConfig(config);
+    this.circuitBreaker = resolved ? new CircuitBreaker(resolved) : null;
+  }
+
+  /**
+   * Set concurrency control on this instance.
+   */
+  setConcurrency(config: number | Partial<ConcurrencyConfig>): void {
+    const resolved = resolveConcurrencyConfig(config);
+    this.concurrencyManager = resolved ? new ConcurrencyManager(resolved) : null;
+  }
+
+  /**
+   * Get the circuit breaker state (returns null if not enabled).
+   */
+  getCircuitState(): CircuitState | null {
+    return this.circuitBreaker ? this.circuitBreaker.getState() : null;
+  }
+
+  /**
    * The main request method. All convenience methods route here.
+   * Integrates rate limiting, circuit breaker, and concurrency control.
    */
   async request<T = unknown>(
     configOrUrl: string | BridgeRequestConfig,
@@ -37,77 +82,110 @@ export class Bridge {
       finalConfig = mergeConfig(this.defaults, configOrUrl);
     }
 
-    // Run request interceptors (in order)
-    const requestInterceptors: InterceptorHandler<BridgeRequestConfig>[] = [];
-    this.interceptors.request.forEach((handler) => {
-      requestInterceptors.push(handler);
-    });
-
-    let currentConfig = finalConfig;
-    for (const interceptor of requestInterceptors) {
-      try {
-        currentConfig = await interceptor.fulfilled(currentConfig);
-      } catch (err) {
-        if (interceptor.rejected) {
-          currentConfig = (await interceptor.rejected(err)) as BridgeRequestConfig;
-        } else {
-          throw err;
-        }
-      }
+    // Circuit breaker check
+    if (this.circuitBreaker && !this.circuitBreaker.allowRequest()) {
+      throw createError(
+        'Circuit breaker is open — request rejected',
+        finalConfig,
+        'ERR_CIRCUIT_OPEN'
+      );
     }
 
-    // Execute the request
-    let response: BridgeResponse<T>;
-    try {
-      response = (await httpAdapter(currentConfig)) as BridgeResponse<T>;
-    } catch (err) {
-      // Run response interceptors' rejected handlers on error
+    // Rate limiting
+    if (this.rateLimiter) {
+      await this.rateLimiter.acquire(finalConfig.signal);
+    }
+
+    // Wrap the actual execution for concurrency control
+    const executeInternal = async (): Promise<BridgeResponse<T>> => {
+      // Run request interceptors (in order)
+      const requestInterceptors: InterceptorHandler<BridgeRequestConfig>[] = [];
+      this.interceptors.request.forEach((handler) => {
+        requestInterceptors.push(handler);
+      });
+
+      let currentConfig = finalConfig;
+      for (const interceptor of requestInterceptors) {
+        try {
+          currentConfig = await interceptor.fulfilled(currentConfig);
+        } catch (err) {
+          if (interceptor.rejected) {
+            currentConfig = (await interceptor.rejected(err)) as BridgeRequestConfig;
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      // Execute the request
+      let response: BridgeResponse<T>;
+      try {
+        response = (await httpAdapter(currentConfig)) as BridgeResponse<T>;
+      } catch (err) {
+        // Record failure in circuit breaker
+        if (this.circuitBreaker) {
+          this.circuitBreaker.recordFailure();
+        }
+
+        // Run response interceptors' rejected handlers on error
+        const responseInterceptors: InterceptorHandler<BridgeResponse>[] = [];
+        this.interceptors.response.forEach((handler) => {
+          responseInterceptors.push(handler);
+        });
+
+        let caughtError: unknown = err;
+        for (const interceptor of responseInterceptors) {
+          if (interceptor.rejected) {
+            try {
+              const result = await interceptor.rejected(caughtError);
+              // If the rejected handler returns a response, treat it as resolved
+              if (result && typeof result === 'object' && 'status' in result) {
+                return result as BridgeResponse<T>;
+              }
+              caughtError = result;
+            } catch (e) {
+              caughtError = e;
+            }
+          }
+        }
+        throw caughtError;
+      }
+
+      // Record success in circuit breaker
+      if (this.circuitBreaker) {
+        this.circuitBreaker.recordSuccess();
+      }
+
+      // Run response interceptors (in order)
       const responseInterceptors: InterceptorHandler<BridgeResponse>[] = [];
       this.interceptors.response.forEach((handler) => {
         responseInterceptors.push(handler);
       });
 
-      let caughtError: unknown = err;
+      let currentResponse: BridgeResponse = response;
       for (const interceptor of responseInterceptors) {
-        if (interceptor.rejected) {
-          try {
-            const result = await interceptor.rejected(caughtError);
-            // If the rejected handler returns a response, treat it as resolved
+        try {
+          currentResponse = await interceptor.fulfilled(currentResponse);
+        } catch (err) {
+          if (interceptor.rejected) {
+            const result = await interceptor.rejected(err);
             if (result && typeof result === 'object' && 'status' in result) {
-              return result as BridgeResponse<T>;
+              currentResponse = result as BridgeResponse;
             }
-            caughtError = result;
-          } catch (e) {
-            caughtError = e;
+          } else {
+            throw err;
           }
         }
       }
-      throw caughtError;
+
+      return currentResponse as BridgeResponse<T>;
+    };
+
+    // Execute with or without concurrency control
+    if (this.concurrencyManager) {
+      return this.concurrencyManager.execute(executeInternal);
     }
-
-    // Run response interceptors (in order)
-    const responseInterceptors: InterceptorHandler<BridgeResponse>[] = [];
-    this.interceptors.response.forEach((handler) => {
-      responseInterceptors.push(handler);
-    });
-
-    let currentResponse: BridgeResponse = response;
-    for (const interceptor of responseInterceptors) {
-      try {
-        currentResponse = await interceptor.fulfilled(currentResponse);
-      } catch (err) {
-        if (interceptor.rejected) {
-          const result = await interceptor.rejected(err);
-          if (result && typeof result === 'object' && 'status' in result) {
-            currentResponse = result as BridgeResponse;
-          }
-        } else {
-          throw err;
-        }
-      }
-    }
-
-    return currentResponse as BridgeResponse<T>;
+    return executeInternal();
   }
 
   /**

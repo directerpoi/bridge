@@ -3,11 +3,12 @@ import * as https from 'https';
 import * as tls from 'tls';
 import * as zlib from 'zlib';
 import { URL } from 'url';
-import { BridgeRequestConfig, BridgeResponse, BridgeError } from './types';
+import { BridgeRequestConfig, BridgeResponse, BridgeError, ProgressEvent } from './types';
 import { createError } from './error';
 import { validateURL, sanitizeHeaders, checkContentLength, dnsResolveAndValidate, injectRequestId } from './security';
 import { buildFullURL } from './utils';
 import { resolveRetryConfig, shouldRetry, calculateDelay, sleep } from './retry';
+import { createTimeline, finalizeTimeline, RequestTimeline } from './timeline';
 
 // ─── Default Config ────────────────────────────────────────────────────────────
 
@@ -15,6 +16,7 @@ const DEFAULT_MAX_REDIRECTS = 5;
 const DEFAULT_TIMEOUT = 0; // no timeout
 const DEFAULT_MAX_CONTENT_LENGTH = 50 * 1024 * 1024; // 50 MB
 const DEFAULT_MAX_BODY_LENGTH = 50 * 1024 * 1024;    // 50 MB
+const MAX_PROGRESS_EVENTS = 100; // Maximum number of progress events during upload
 
 // ─── Adapter ───────────────────────────────────────────────────────────────────
 
@@ -51,6 +53,12 @@ async function executeWithRetry(
       }
 
       const delay = calculateDelay(retryConfig, attempt);
+
+      // Fire onRetry hook
+      if (config.hooks?.onRetry) {
+        config.hooks.onRetry(attempt + 1, bridgeError, delay);
+      }
+
       await sleep(delay, config.signal);
     }
   }
@@ -60,6 +68,16 @@ async function executeWithRetry(
 
 function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
   return new Promise((resolve, reject) => {
+    // Fire onRequest hook
+    if (config.hooks?.onRequest) {
+      config.hooks.onRequest(config);
+    }
+
+    // Initialize timeline if requested
+    const timeline: RequestTimeline | undefined = config.collectTimeline
+      ? createTimeline()
+      : undefined;
+
     // Inject request ID if enabled
     const headersWithId = injectRequestId(config);
     const configWithId = { ...config, headers: headersWithId };
@@ -74,7 +92,9 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
         configWithId.enforceHttps
       );
     } catch (err) {
-      reject(createError((err as Error).message, configWithId, 'ERR_INVALID_URL'));
+      const error = createError((err as Error).message, configWithId, 'ERR_INVALID_URL');
+      if (config.hooks?.onError) config.hooks.onError(error);
+      reject(error);
       return;
     }
 
@@ -83,7 +103,9 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
     try {
       headers = sanitizeHeaders(configWithId.headers);
     } catch (err) {
-      reject(createError((err as Error).message, configWithId, 'ERR_HEADER_INJECTION'));
+      const error = createError((err as Error).message, configWithId, 'ERR_HEADER_INJECTION');
+      if (config.hooks?.onError) config.hooks.onError(error);
+      reject(error);
       return;
     }
     const timeout = configWithId.timeout ?? DEFAULT_TIMEOUT;
@@ -121,13 +143,13 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
         ? Buffer.byteLength(requestData)
         : requestData.length;
       if (bodyLen > maxBodyLength) {
-        reject(
-          createError(
-            `Request body size ${bodyLen} exceeds maxBodyLength ${maxBodyLength}`,
-            configWithId,
-            'ERR_BODY_TOO_LARGE'
-          )
+        const error = createError(
+          `Request body size ${bodyLen} exceeds maxBodyLength ${maxBodyLength}`,
+          configWithId,
+          'ERR_BODY_TOO_LARGE'
         );
+        if (config.hooks?.onError) config.hooks.onError(error);
+        reject(error);
         return;
       }
 
@@ -151,7 +173,9 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
 
     // Early abort check — before creating any request
     if (configWithId.signal && configWithId.signal.aborted) {
-      reject(createError('Request aborted', configWithId, 'ERR_CANCELED'));
+      const error = createError('Request aborted', configWithId, 'ERR_CANCELED');
+      if (config.hooks?.onError) config.hooks.onError(error);
+      reject(error);
       return;
     }
 
@@ -218,6 +242,11 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
           (res: http.IncomingMessage) => {
             const statusCode = res.statusCode || 0;
 
+            // Timeline: first byte
+            if (timeline) {
+              timeline.firstByte = Date.now() - timeline.startTime;
+            }
+
             // Certificate pinning verification
             if (configWithId.tls?.certFingerprint && reqURL.protocol === 'https:') {
               const socket = res.socket as tls.TLSSocket;
@@ -227,13 +256,13 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                   const normalizedExpected = configWithId.tls.certFingerprint.toUpperCase().replace(/:/g, '');
                   const normalizedActual = cert.fingerprint256.toUpperCase().replace(/:/g, '');
                   if (normalizedExpected !== normalizedActual) {
-                    reject(
-                      createError(
-                        `Certificate fingerprint mismatch. Expected: ${configWithId.tls.certFingerprint}, Got: ${cert.fingerprint256}`,
-                        configWithId,
-                        'ERR_CERT_FINGERPRINT_MISMATCH'
-                      )
+                    const error = createError(
+                      `Certificate fingerprint mismatch. Expected: ${configWithId.tls.certFingerprint}, Got: ${cert.fingerprint256}`,
+                      configWithId,
+                      'ERR_CERT_FINGERPRINT_MISMATCH'
                     );
+                    if (config.hooks?.onError) config.hooks.onError(error);
+                    reject(error);
                     req.destroy();
                     return;
                   }
@@ -248,13 +277,13 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
             ) {
               redirectCount++;
               if (redirectCount > maxRedirects) {
-                reject(
-                  createError(
-                    `Maximum redirects (${maxRedirects}) exceeded`,
-                    configWithId,
-                    'ERR_MAX_REDIRECTS'
-                  )
+                const error = createError(
+                  `Maximum redirects (${maxRedirects}) exceeded`,
+                  configWithId,
+                  'ERR_MAX_REDIRECTS'
                 );
+                if (config.hooks?.onError) config.hooks.onError(error);
+                reject(error);
                 req.destroy();
                 return;
               }
@@ -263,13 +292,13 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
               try {
                 redirectURL = new URL(res.headers.location, reqURL);
               } catch {
-                reject(
-                  createError(
-                    `Invalid redirect URL: ${res.headers.location}`,
-                    configWithId,
-                    'ERR_INVALID_URL'
-                  )
+                const error = createError(
+                  `Invalid redirect URL: ${res.headers.location}`,
+                  configWithId,
+                  'ERR_INVALID_URL'
                 );
+                if (config.hooks?.onError) config.hooks.onError(error);
+                reject(error);
                 req.destroy();
                 return;
               }
@@ -282,7 +311,9 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                   configWithId.enforceHttps
                 );
               } catch (err) {
-                reject(createError((err as Error).message, configWithId, 'ERR_INVALID_URL'));
+                const error = createError((err as Error).message, configWithId, 'ERR_INVALID_URL');
+                if (config.hooks?.onError) config.hooks.onError(error);
+                reject(error);
                 req.destroy();
                 return;
               }
@@ -335,28 +366,33 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                 statusText: res.statusMessage || '',
                 headers: responseHeaders,
                 config: configWithId,
+                ...(timeline ? { timeline: finalizeTimeline(timeline) } : {}),
               };
 
               const validateStatus = configWithId.validateStatus || defaultValidateStatus;
               if (validateStatus(statusCode)) {
+                if (config.hooks?.onResponse) config.hooks.onResponse(response);
                 resolve(response);
               } else {
-                reject(
-                  createError(
-                    `Request failed with status code ${statusCode}`,
-                    configWithId,
-                    'ERR_BAD_RESPONSE',
-                    response
-                  )
+                const error = createError(
+                  `Request failed with status code ${statusCode}`,
+                  configWithId,
+                  'ERR_BAD_RESPONSE',
+                  response
                 );
+                if (config.hooks?.onError) config.hooks.onError(error);
+                reject(error);
               }
               return;
             }
 
-            // Buffer the response body
+            // Buffer the response body with progress tracking
             const chunks: Buffer[] = [];
             let totalLength = 0;
             let responseTimedOut = false;
+            const downloadStartTime = Date.now();
+            const contentLengthHeader = res.headers['content-length'];
+            const expectedTotal = contentLengthHeader ? parseInt(contentLengthHeader, 10) : 0;
 
             // Response timeout (for body download)
             let responseTimer: ReturnType<typeof setTimeout> | undefined;
@@ -364,13 +400,13 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
               responseTimer = setTimeout(() => {
                 responseTimedOut = true;
                 (responseStream as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
-                reject(
-                  createError(
-                    `Response timeout of ${responseTimeout}ms exceeded`,
-                    configWithId,
-                    'ERR_RESPONSE_TIMEOUT'
-                  )
+                const error = createError(
+                  `Response timeout of ${responseTimeout}ms exceeded`,
+                  configWithId,
+                  'ERR_RESPONSE_TIMEOUT'
                 );
+                if (config.hooks?.onError) config.hooks.onError(error);
+                reject(error);
               }, responseTimeout);
             }
 
@@ -380,27 +416,54 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
               if (!checkContentLength(totalLength, maxContentLength)) {
                 if (responseTimer) clearTimeout(responseTimer);
                 (responseStream as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
-                reject(
-                  createError(
-                    `Response size ${totalLength} exceeds maxContentLength ${maxContentLength}`,
-                    configWithId,
-                    'ERR_CONTENT_TOO_LARGE'
-                  )
+                const error = createError(
+                  `Response size ${totalLength} exceeds maxContentLength ${maxContentLength}`,
+                  configWithId,
+                  'ERR_CONTENT_TOO_LARGE'
                 );
+                if (config.hooks?.onError) config.hooks.onError(error);
+                reject(error);
                 return;
               }
               chunks.push(chunk);
+
+              // Fire download progress callback
+              if (configWithId.onDownloadProgress) {
+                const elapsed = Date.now() - downloadStartTime;
+                const rate = elapsed > 0 ? (totalLength / elapsed) * 1000 : 0;
+                const progress = expectedTotal > 0
+                  ? Math.round((totalLength / expectedTotal) * 100)
+                  : -1;
+                const estimated = expectedTotal > 0 && rate > 0
+                  ? Math.round(((expectedTotal - totalLength) / rate) * 1000)
+                  : -1;
+                const event: ProgressEvent = {
+                  loaded: totalLength,
+                  total: expectedTotal,
+                  progress,
+                  rate,
+                  estimated,
+                };
+                configWithId.onDownloadProgress(event);
+              }
             });
 
             responseStream.on('error', (err: Error) => {
               if (responseTimedOut) return;
               if (responseTimer) clearTimeout(responseTimer);
-              reject(createError(err.message, configWithId, 'ERR_NETWORK'));
+              const error = createError(err.message, configWithId, 'ERR_NETWORK');
+              if (config.hooks?.onError) config.hooks.onError(error);
+              reject(error);
             });
 
             responseStream.on('end', () => {
               if (responseTimedOut) return;
               if (responseTimer) clearTimeout(responseTimer);
+
+              // Timeline: content download
+              if (timeline) {
+                timeline.contentDownload = Date.now() - downloadStartTime;
+              }
 
               const buffer = Buffer.concat(chunks);
               const responseHeaders: Record<string, string> = {};
@@ -440,41 +503,61 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                 statusText: res.statusMessage || '',
                 headers: responseHeaders,
                 config: configWithId,
+                ...(timeline ? { timeline: finalizeTimeline(timeline) } : {}),
               };
 
               const validateStatus = configWithId.validateStatus || defaultValidateStatus;
               if (validateStatus(statusCode)) {
+                if (config.hooks?.onResponse) config.hooks.onResponse(response);
                 resolve(response);
               } else {
-                reject(
-                  createError(
-                    `Request failed with status code ${statusCode}`,
-                    configWithId,
-                    'ERR_BAD_RESPONSE',
-                    response
-                  )
+                const error = createError(
+                  `Request failed with status code ${statusCode}`,
+                  configWithId,
+                  'ERR_BAD_RESPONSE',
+                  response
                 );
+                if (config.hooks?.onError) config.hooks.onError(error);
+                reject(error);
               }
             });
           }
         );
 
+        // Track socket events for timeline
+        if (timeline) {
+          req.on('socket', (socket) => {
+            const socketStartTime = Date.now();
+            socket.once('lookup', () => {
+              timeline.dnsLookup = Date.now() - socketStartTime;
+            });
+            socket.once('connect', () => {
+              timeline.tcpConnect = Date.now() - socketStartTime;
+            });
+            socket.once('secureConnect', () => {
+              timeline.tlsHandshake = Date.now() - socketStartTime - timeline.tcpConnect;
+            });
+          });
+        }
+
         // Error handler — must be registered before any destroy() calls
         req.on('error', (err: NodeJS.ErrnoException) => {
-          reject(createError(err.message, configWithId, err.code || 'ERR_NETWORK'));
+          const error = createError(err.message, configWithId, err.code || 'ERR_NETWORK');
+          if (config.hooks?.onError) config.hooks.onError(error);
+          reject(error);
         });
 
         // Timeout
         if (timeout > 0) {
           req.setTimeout(timeout, () => {
             req.destroy();
-            reject(
-              createError(
-                `Timeout of ${timeout}ms exceeded`,
-                configWithId,
-                'ECONNABORTED'
-              )
+            const error = createError(
+              `Timeout of ${timeout}ms exceeded`,
+              configWithId,
+              'ECONNABORTED'
             );
+            if (config.hooks?.onError) config.hooks.onError(error);
+            reject(error);
           });
         }
 
@@ -482,13 +565,13 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
         if (configWithId.signal) {
           const onAbort = () => {
             req.destroy();
-            reject(
-              createError(
-                'Request aborted',
-                configWithId,
-                'ERR_CANCELED'
-              )
+            const error = createError(
+              'Request aborted',
+              configWithId,
+              'ERR_CANCELED'
             );
+            if (config.hooks?.onError) config.hooks.onError(error);
+            reject(error);
           };
           if (configWithId.signal.aborted) {
             onAbort();
@@ -497,11 +580,56 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
           configWithId.signal.addEventListener('abort', onAbort, { once: true });
         }
 
-        // Write body and send
+        // Write body with upload progress tracking
         if (requestData) {
-          req.write(requestData);
+          if (configWithId.onUploadProgress) {
+            const dataBuffer = typeof requestData === 'string'
+              ? Buffer.from(requestData)
+              : requestData;
+            const totalSize = dataBuffer.length;
+            const chunkSize = Math.max(1024, Math.ceil(totalSize / MAX_PROGRESS_EVENTS));
+            let bytesSent = 0;
+            const uploadStartTime = Date.now();
+
+            let offset = 0;
+            const writeChunk = () => {
+              while (offset < totalSize) {
+                const end = Math.min(offset + chunkSize, totalSize);
+                const chunk = dataBuffer.subarray(offset, end);
+                offset = end;
+                bytesSent += chunk.length;
+
+                const elapsed = Date.now() - uploadStartTime;
+                const rate = elapsed > 0 ? (bytesSent / elapsed) * 1000 : 0;
+                const progress = Math.round((bytesSent / totalSize) * 100);
+                const estimated = rate > 0
+                  ? Math.round(((totalSize - bytesSent) / rate) * 1000)
+                  : -1;
+
+                configWithId.onUploadProgress!({
+                  loaded: bytesSent,
+                  total: totalSize,
+                  progress,
+                  rate,
+                  estimated,
+                });
+
+                const canContinue = req.write(chunk);
+                if (!canContinue) {
+                  req.once('drain', writeChunk);
+                  return;
+                }
+              }
+              req.end();
+            };
+            writeChunk();
+          } else {
+            req.write(requestData);
+            req.end();
+          }
+        } else {
+          req.end();
         }
-        req.end();
       }
 
       doRequest(requestOptions, parsedURL);
@@ -510,8 +638,17 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
     // Execute with optional DNS protection
     if (dnsProtection && !parsedURL.hostname.match(/^\d+\.\d+\.\d+\.\d+$/)) {
       dnsResolveAndValidate(parsedURL.hostname, allowPrivate)
-        .then((resolvedIP) => startRequest(resolvedIP))
-        .catch((err) => reject(createError((err as Error).message, configWithId, 'ERR_DNS_RESOLUTION')));
+        .then((resolvedIP) => {
+          if (timeline) {
+            timeline.dnsLookup = Date.now() - timeline.startTime;
+          }
+          startRequest(resolvedIP);
+        })
+        .catch((err) => {
+          const error = createError((err as Error).message, configWithId, 'ERR_DNS_RESOLUTION');
+          if (config.hooks?.onError) config.hooks.onError(error);
+          reject(error);
+        });
     } else {
       startRequest();
     }
