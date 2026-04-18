@@ -1,5 +1,8 @@
 // ─── Core Types ────────────────────────────────────────────────────────────────
 
+import type { RequestTimeline } from './timeline';
+import type { CircuitState } from './circuit-breaker';
+
 export type Method =
   | 'get' | 'GET'
   | 'delete' | 'DELETE'
@@ -49,6 +52,63 @@ export interface TLSConfig {
   certFingerprint?: string;
 }
 
+// ─── Rate Limit Types ──────────────────────────────────────────────────────────
+
+export interface RateLimitConfig {
+  /** Maximum number of requests allowed in the time window (default: 10) */
+  maxRequests: number;
+  /** Time window in milliseconds (default: 1000 = 1 second) */
+  windowMs: number;
+}
+
+// ─── Circuit Breaker Types ─────────────────────────────────────────────────────
+
+export interface CircuitBreakerConfig {
+  /** Number of failures before the circuit opens (default: 5) */
+  failureThreshold: number;
+  /** Time in ms before attempting to half-open the circuit (default: 30000) */
+  resetTimeout: number;
+  /** Number of successful requests in half-open state to close the circuit (default: 1) */
+  halfOpenRequests: number;
+  /** Optional callback when circuit state changes */
+  onStateChange?: (from: CircuitState, to: CircuitState) => void;
+}
+
+// ─── Concurrency Types ─────────────────────────────────────────────────────────
+
+export interface ConcurrencyConfig {
+  /** Maximum number of concurrent requests (default: 10) */
+  maxConcurrent: number;
+}
+
+// ─── Progress Types ────────────────────────────────────────────────────────────
+
+export interface ProgressEvent {
+  /** Number of bytes transferred so far */
+  loaded: number;
+  /** Total number of bytes to transfer (may be 0 if unknown) */
+  total: number;
+  /** Progress percentage (0-100, or -1 if total is unknown) */
+  progress: number;
+  /** Estimated transfer rate in bytes per second */
+  rate: number;
+  /** Estimated time remaining in milliseconds (-1 if unknown) */
+  estimated: number;
+}
+
+// ─── Event Hooks Types ─────────────────────────────────────────────────────────
+
+export interface EventHooks {
+  /** Called before a request is sent (after interceptors) */
+  onRequest?: (config: BridgeRequestConfig) => void;
+  /** Called when a response is received (before interceptors) */
+  onResponse?: (response: BridgeResponse) => void;
+  /** Called when a request fails */
+  onError?: (error: BridgeError) => void;
+  /** Called before a retry attempt */
+  onRetry?: (attempt: number, error: BridgeError, delay: number) => void;
+}
+
 export interface BridgeRequestConfig {
   url?: string;
   method?: Method;
@@ -95,6 +155,19 @@ export interface BridgeRequestConfig {
   // Observability
   /** Enable automatic X-Request-ID header injection */
   requestId?: boolean | string;
+
+  // ─── v4.0.0 Features ──────────────────────────────────────────────────────
+
+  /** Upload progress callback */
+  onUploadProgress?: (event: ProgressEvent) => void;
+  /** Download progress callback */
+  onDownloadProgress?: (event: ProgressEvent) => void;
+
+  /** Enable request timeline/metrics collection */
+  collectTimeline?: boolean;
+
+  /** Event lifecycle hooks */
+  hooks?: EventHooks;
 }
 
 export interface BridgeResponse<T = unknown> {
@@ -103,6 +176,8 @@ export interface BridgeResponse<T = unknown> {
   statusText: string;
   headers: Record<string, string>;
   config: BridgeRequestConfig;
+  /** Request timing metrics (only present when collectTimeline: true) */
+  timeline?: RequestTimeline;
 }
 
 export interface BridgeError extends Error {
@@ -160,6 +235,15 @@ export interface BridgeInstance {
 
   getUri(config?: BridgeRequestConfig): string;
   create(config?: BridgeRequestConfig): BridgeInstance;
+
+  /** Set a rate limiter on this instance */
+  setRateLimiter(config: boolean | Partial<RateLimitConfig>): void;
+  /** Set a circuit breaker on this instance */
+  setCircuitBreaker(config: boolean | Partial<CircuitBreakerConfig>): void;
+  /** Set concurrency control on this instance */
+  setConcurrency(config: number | Partial<ConcurrencyConfig>): void;
+  /** Get the circuit breaker state (returns null if not enabled) */
+  getCircuitState(): CircuitState | null;
 }
 
 export interface InterceptorManager<V> {
@@ -181,6 +265,15 @@ export interface BridgeStatic extends BridgeInstance {
   isAxiosError(value: unknown): boolean;
   all<T>(values: Array<T | Promise<T>>): Promise<T[]>;
   spread<T, R>(callback: (...args: T[]) => R): (array: T[]) => R;
+
+  /** Set a rate limiter on this instance */
+  setRateLimiter(config: boolean | Partial<RateLimitConfig>): void;
+  /** Set a circuit breaker on this instance */
+  setCircuitBreaker(config: boolean | Partial<CircuitBreakerConfig>): void;
+  /** Set concurrency control on this instance */
+  setConcurrency(config: number | Partial<ConcurrencyConfig>): void;
+  /** Get the circuit breaker state (returns null if not enabled) */
+  getCircuitState(): CircuitState | null;
 }
 
 export interface CancelTokenStatic {

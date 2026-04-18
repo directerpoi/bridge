@@ -1,6 +1,9 @@
 import { createBridgeInstance } from './bridge';
 import { CancelToken, isCancel } from './cancel';
 import { isBridgeError } from './error';
+import { RateLimiter } from './ratelimit';
+import { CircuitBreaker } from './circuit-breaker';
+import { ConcurrencyManager } from './concurrency';
 import {
   BridgeRequestConfig,
   BridgeResponse,
@@ -13,14 +16,21 @@ import {
   InterceptorManager,
   RetryConfig,
   TLSConfig,
+  RateLimitConfig,
+  CircuitBreakerConfig,
+  ConcurrencyConfig,
+  ProgressEvent,
+  EventHooks,
 } from './types';
+import type { RequestTimeline } from './timeline';
+import type { CircuitState } from './circuit-breaker';
 
 // ─── Create Default Instance ───────────────────────────────────────────────────
 
 const bridge = createBridgeInstance({
   headers: {
     'Accept': 'application/json, text/plain, */*',
-    'User-Agent': 'bridge/3.0.0',
+    'User-Agent': 'bridge/4.0.0',
   },
   timeout: 0,
   responseType: 'json',
@@ -56,6 +66,9 @@ export { bridge };
 export { createBridgeInstance as create };
 export { CancelToken, isCancel };
 export { isBridgeError, isBridgeError as isAxiosError };
+export { RateLimiter };
+export { CircuitBreaker };
+export { ConcurrencyManager };
 
 // Re-export types
 export type {
@@ -70,6 +83,13 @@ export type {
   InterceptorManager,
   RetryConfig,
   TLSConfig,
+  RateLimitConfig,
+  CircuitBreakerConfig,
+  ConcurrencyConfig,
+  ProgressEvent,
+  EventHooks,
+  RequestTimeline,
+  CircuitState,
 };
 
 // CommonJS compatibility
@@ -81,3 +101,6 @@ module.exports.CancelToken = CancelToken;
 module.exports.isCancel = isCancel;
 module.exports.isBridgeError = isBridgeError;
 module.exports.isAxiosError = isBridgeError;
+module.exports.RateLimiter = RateLimiter;
+module.exports.CircuitBreaker = CircuitBreaker;
+module.exports.ConcurrencyManager = ConcurrencyManager;
