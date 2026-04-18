@@ -22,6 +22,13 @@ Bridge is a zero-dependency HTTP client with an axios-compatible API. Drop-in re
 - **🔒 HTTPS Enforcement** — option to reject all non-HTTPS requests
 - **📝 TypeScript** — full type definitions included
 
+### v5.0.0 — Enhanced Security
+
+- **🛡️ Domain Allowlist** — restrict requests to approved domains only, with wildcard subdomain support
+- **🚫 Domain Blocklist** — block requests to specific domains, with wildcard subdomain support
+- **🔐 Sensitive Header Stripping on Redirects** — automatically strips `Authorization`, `Cookie`, and `Proxy-Authorization` headers on cross-origin redirects (enabled by default)
+- **🔒 HTTPS Downgrade Protection** — blocks HTTPS → HTTP protocol downgrades on redirects by default
+
 ### v4.0.0 — New Features
 
 - **🚦 Rate Limiting** — built-in token bucket rate limiter to control request throughput
@@ -451,6 +458,66 @@ Beyond basic private IP ranges, Bridge also blocks:
 - Multicast & reserved ranges (224.0.0.0/4, 240.0.0.0/4)
 - IPv6 multicast (ff00::/8)
 
+### Domain Allowlist / Blocklist *(v5.0.0)*
+
+Restrict which domains your application can communicate with:
+
+```typescript
+// Only allow requests to specific domains
+const api = bridge.create({
+  allowedDomains: ['api.example.com', '*.trusted-partner.com'],
+});
+
+await api.get('https://api.example.com/data');     // ✅ Allowed
+await api.get('https://evil.com/steal');            // ❌ Blocked
+
+// Block specific domains
+const safe = bridge.create({
+  blockedDomains: ['evil.com', '*.malware.net'],
+});
+
+await safe.get('https://api.example.com/data');     // ✅ Allowed
+await safe.get('https://evil.com/steal');            // ❌ Blocked
+await safe.get('https://sub.malware.net/payload');   // ❌ Blocked
+```
+
+Wildcard patterns (`*.example.com`) match the base domain and all subdomains. The blocklist is evaluated before the allowlist — if a domain appears in both, it is blocked.
+
+### Sensitive Header Stripping on Redirects *(v5.0.0)*
+
+When following redirects to a different origin, Bridge automatically strips sensitive headers (`Authorization`, `Cookie`, `Proxy-Authorization`) to prevent credential leakage. This is enabled by default:
+
+```typescript
+// Sensitive headers are stripped on cross-origin redirects (default behavior)
+await bridge.get('https://api.example.com/endpoint', {
+  headers: { 'Authorization': 'Bearer token' },
+});
+// If the server redirects to https://other.com/callback,
+// the Authorization header is automatically removed.
+
+// Disable if you explicitly need to forward credentials across origins
+await bridge.get('https://api.example.com/endpoint', {
+  stripSensitiveHeadersOnRedirect: false,
+  headers: { 'Authorization': 'Bearer token' },
+});
+```
+
+### HTTPS Downgrade Protection *(v5.0.0)*
+
+Bridge blocks redirects that downgrade from HTTPS to HTTP by default, preventing man-in-the-middle exposure of encrypted traffic:
+
+```typescript
+// HTTPS → HTTP redirects are blocked by default
+await bridge.get('https://api.example.com/endpoint');
+// If the server redirects to http://api.example.com/other,
+// Bridge throws: "Redirect from HTTPS to HTTP is blocked"
+
+// Allow downgrade if explicitly needed (not recommended)
+await bridge.get('https://api.example.com/endpoint', {
+  allowHttpsDowngrade: true,
+});
+```
+
 ## 🚦 Rate Limiting
 
 Control request throughput with a built-in token bucket rate limiter:
@@ -683,6 +750,9 @@ const { data } = await api.get('/users');
 | Progress events | ❌ | ✅ |
 | Request timeline/metrics | ❌ | ✅ |
 | Event hooks | ❌ | ✅ |
+| Domain allowlist/blocklist | ❌ | ✅ |
+| Sensitive header stripping on redirects | ❌ | ✅ |
+| HTTPS downgrade protection | ❌ | ✅ |
 
 ## 📄 License
 

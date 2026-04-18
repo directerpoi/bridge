@@ -139,6 +139,16 @@ export interface BridgeRequestConfig {
   /** Enable DNS-based SSRF protection (resolves hostname and validates IP before connecting) */
   dnsProtection?: boolean;
 
+  // ─── v5.0.0 Security Features ──────────────────────────────────────────────
+  /** Allowlist of domains. If set, only requests to these domains are allowed. Supports wildcard subdomains (e.g. '*.example.com'). */
+  allowedDomains?: string[];
+  /** Blocklist of domains. Requests to these domains are blocked. Supports wildcard subdomains (e.g. '*.evil.com'). */
+  blockedDomains?: string[];
+  /** Strip sensitive headers (Authorization, Cookie, Proxy-Authorization) on cross-origin redirects (default: true) */
+  stripSensitiveHeadersOnRedirect?: boolean;
+  /** Allow HTTPS to HTTP downgrade on redirects (default: false — blocks downgrade) */
+  allowHttpsDowngrade?: boolean;
+
   // Retry options
   /** Enable automatic retry with exponential backoff. Pass true for defaults or a RetryConfig. */
   retry?: boolean | Partial<RetryConfig>;

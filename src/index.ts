@@ -30,7 +30,7 @@ import type { CircuitState } from './circuit-breaker';
 const bridge = createBridgeInstance({
   headers: {
     'Accept': 'application/json, text/plain, */*',
-    'User-Agent': 'bridge/4.0.0',
+    'User-Agent': 'bridge/5.0.0',
   },
   timeout: 0,
   responseType: 'json',

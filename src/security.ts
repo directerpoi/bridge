@@ -272,3 +272,105 @@ export function injectRequestId(config: BridgeRequestConfig): Record<string, str
   return headers;
 }
 
+// ─── v5.0.0 Security Features ─────────────────────────────────────────────────
+
+/** Headers considered sensitive that should be stripped on cross-origin redirects */
+const SENSITIVE_HEADERS = new Set([
+  'authorization',
+  'cookie',
+  'proxy-authorization',
+]);
+
+/**
+ * Matches a hostname against a domain pattern.
+ * Supports exact match and wildcard subdomain patterns (e.g. '*.example.com').
+ */
+function matchesDomainPattern(hostname: string, pattern: string): boolean {
+  const lowerHost = hostname.toLowerCase();
+  const lowerPattern = pattern.toLowerCase();
+
+  if (lowerPattern.startsWith('*.')) {
+    const baseDomain = lowerPattern.slice(2);
+    // Match the base domain itself or any subdomain
+    return lowerHost === baseDomain || lowerHost.endsWith('.' + baseDomain);
+  }
+
+  return lowerHost === lowerPattern;
+}
+
+/**
+ * Validates a hostname against domain allowlist and blocklist.
+ * Throws if the hostname is not in the allowlist (when set) or is in the blocklist.
+ */
+export function validateDomain(
+  hostname: string,
+  allowedDomains?: string[],
+  blockedDomains?: string[]
+): void {
+  if (blockedDomains && blockedDomains.length > 0) {
+    for (const pattern of blockedDomains) {
+      if (matchesDomainPattern(hostname, pattern)) {
+        throw new Error(
+          `Request to domain "${hostname}" is blocked by the domain blocklist.`
+        );
+      }
+    }
+  }
+
+  if (allowedDomains && allowedDomains.length > 0) {
+    const isAllowed = allowedDomains.some((pattern) =>
+      matchesDomainPattern(hostname, pattern)
+    );
+    if (!isAllowed) {
+      throw new Error(
+        `Request to domain "${hostname}" is not in the domain allowlist.`
+      );
+    }
+  }
+}
+
+/**
+ * Checks whether two URLs have the same origin (protocol + hostname + port).
+ */
+export function isSameOrigin(from: url.URL, to: url.URL): boolean {
+  return (
+    from.protocol === to.protocol &&
+    from.hostname === to.hostname &&
+    from.port === to.port
+  );
+}
+
+/**
+ * Strips sensitive headers (Authorization, Cookie, Proxy-Authorization) from a headers
+ * object. Used when following cross-origin redirects to prevent credential leakage.
+ * Returns a new object without the sensitive headers.
+ */
+export function stripSensitiveHeaders(
+  headers: Record<string, string>
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (!SENSITIVE_HEADERS.has(key.toLowerCase())) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/**
+ * Checks for HTTPS to HTTP protocol downgrade in a redirect.
+ * Throws if the redirect would downgrade from HTTPS to HTTP and downgrade is not allowed.
+ */
+export function checkHttpsDowngrade(
+  fromURL: url.URL,
+  toURL: url.URL,
+  allowDowngrade: boolean
+): void {
+  if (!allowDowngrade && fromURL.protocol === 'https:' && toURL.protocol === 'http:') {
+    throw new Error(
+      'Redirect from HTTPS to HTTP is blocked (protocol downgrade). ' +
+      'Set allowHttpsDowngrade: true to allow this.'
+    );
+  }
+}
+

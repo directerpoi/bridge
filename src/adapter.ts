@@ -5,7 +5,7 @@ import * as zlib from 'zlib';
 import { URL } from 'url';
 import { BridgeRequestConfig, BridgeResponse, BridgeError, ProgressEvent } from './types';
 import { createError } from './error';
-import { validateURL, sanitizeHeaders, checkContentLength, dnsResolveAndValidate, injectRequestId } from './security';
+import { validateURL, sanitizeHeaders, checkContentLength, dnsResolveAndValidate, injectRequestId, validateDomain, isSameOrigin, stripSensitiveHeaders, checkHttpsDowngrade } from './security';
 import { buildFullURL } from './utils';
 import { resolveRetryConfig, shouldRetry, calculateDelay, sleep } from './retry';
 import { createTimeline, finalizeTimeline, RequestTimeline } from './timeline';
@@ -93,6 +93,20 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
       );
     } catch (err) {
       const error = createError((err as Error).message, configWithId, 'ERR_INVALID_URL');
+      if (config.hooks?.onError) config.hooks.onError(error);
+      reject(error);
+      return;
+    }
+
+    // v5.0.0: Domain allowlist/blocklist validation
+    try {
+      validateDomain(
+        parsedURL.hostname,
+        configWithId.allowedDomains,
+        configWithId.blockedDomains
+      );
+    } catch (err) {
+      const error = createError((err as Error).message, configWithId, 'ERR_DOMAIN_BLOCKED');
       if (config.hooks?.onError) config.hooks.onError(error);
       reject(error);
       return;
@@ -318,12 +332,50 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                 return;
               }
 
+              // v5.0.0: Validate redirect domain against allowlist/blocklist
+              try {
+                validateDomain(
+                  redirectURL.hostname,
+                  configWithId.allowedDomains,
+                  configWithId.blockedDomains
+                );
+              } catch (err) {
+                const error = createError((err as Error).message, configWithId, 'ERR_DOMAIN_BLOCKED');
+                if (config.hooks?.onError) config.hooks.onError(error);
+                reject(error);
+                req.destroy();
+                return;
+              }
+
+              // v5.0.0: HTTPS downgrade protection on redirects
+              try {
+                checkHttpsDowngrade(
+                  reqURL,
+                  redirectURL,
+                  configWithId.allowHttpsDowngrade ?? false
+                );
+              } catch (err) {
+                const error = createError((err as Error).message, configWithId, 'ERR_HTTPS_DOWNGRADE');
+                if (config.hooks?.onError) config.hooks.onError(error);
+                reject(error);
+                req.destroy();
+                return;
+              }
+
               const redirectOptions: http.RequestOptions = {
                 ...reqOptions,
                 hostname: redirectURL.hostname,
                 port: redirectURL.port || (redirectURL.protocol === 'https:' ? 443 : 80),
                 path: redirectURL.pathname + redirectURL.search,
               };
+
+              // v5.0.0: Strip sensitive headers on cross-origin redirects
+              const shouldStripSensitive = configWithId.stripSensitiveHeadersOnRedirect !== false;
+              if (shouldStripSensitive && !isSameOrigin(reqURL, redirectURL)) {
+                redirectOptions.headers = stripSensitiveHeaders(
+                  redirectOptions.headers as Record<string, string>
+                );
+              }
 
               // 303 always becomes GET
               if (statusCode === 303) {
