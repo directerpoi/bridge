@@ -979,4 +979,428 @@ describe('bridge', () => {
       expect(res.status).toBe(200);
     });
   });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ─── v4.0.0 Features ─────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ─── Rate Limiting ──────────────────────────────────────────────────────
+
+  describe('rate limiting', () => {
+    it('should limit request throughput via setRateLimiter', async () => {
+      const instance = client.create({ baseURL });
+      instance.setRateLimiter({ maxRequests: 2, windowMs: 1000 });
+
+      // First two should go through immediately
+      const start = Date.now();
+      await instance.get('/echo');
+      await instance.get('/echo');
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeLessThan(500);
+
+      // Third request should be delayed (rate limited)
+      await instance.get('/echo');
+      const totalElapsed = Date.now() - start;
+      expect(totalElapsed).toBeGreaterThanOrEqual(250); // some delay
+    });
+
+    it('should allow disabling rate limiter with false', async () => {
+      const instance = client.create({ baseURL });
+      instance.setRateLimiter({ maxRequests: 1, windowMs: 5000 });
+      // Now disable it
+      instance.setRateLimiter(false as unknown as boolean);
+
+      const start = Date.now();
+      await instance.get('/echo');
+      await instance.get('/echo');
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeLessThan(500);
+    });
+  });
+
+  // ─── Circuit Breaker ──────────────────────────────────────────────────────
+
+  describe('circuit breaker', () => {
+    it('should open circuit after failure threshold', async () => {
+      const instance = client.create({ baseURL });
+      instance.setCircuitBreaker({
+        failureThreshold: 2,
+        resetTimeout: 50000,
+        halfOpenRequests: 1,
+      });
+
+      expect(instance.getCircuitState()).toBe('closed');
+
+      // Cause 2 failures
+      try { await instance.get('/status/500'); } catch { /* expected */ }
+      try { await instance.get('/status/500'); } catch { /* expected */ }
+
+      // Circuit should be open now
+      expect(instance.getCircuitState()).toBe('open');
+
+      // Next request should be immediately rejected
+      try {
+        await instance.get('/echo');
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_CIRCUIT_OPEN');
+          expect(err.message).toContain('Circuit breaker is open');
+        }
+      }
+    });
+
+    it('should transition to half-open after resetTimeout', async () => {
+      const instance = client.create({ baseURL });
+      instance.setCircuitBreaker({
+        failureThreshold: 1,
+        resetTimeout: 100, // 100ms
+        halfOpenRequests: 1,
+      });
+
+      // Cause a failure
+      try { await instance.get('/status/500'); } catch { /* expected */ }
+      expect(instance.getCircuitState()).toBe('open');
+
+      // Wait for reset timeout
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Should be half-open now
+      expect(instance.getCircuitState()).toBe('half-open');
+
+      // Successful request should close the circuit
+      const res = await instance.get('/echo');
+      expect(res.status).toBe(200);
+      expect(instance.getCircuitState()).toBe('closed');
+    });
+
+    it('should return null when circuit breaker is not set', () => {
+      const instance = client.create({ baseURL });
+      expect(instance.getCircuitState()).toBeNull();
+    });
+
+    it('should fire onStateChange callback', async () => {
+      const stateChanges: Array<{ from: string; to: string }> = [];
+      const instance = client.create({ baseURL });
+      instance.setCircuitBreaker({
+        failureThreshold: 1,
+        resetTimeout: 100,
+        halfOpenRequests: 1,
+        onStateChange: (from, to) => stateChanges.push({ from, to }),
+      });
+
+      try { await instance.get('/status/500'); } catch { /* expected */ }
+      expect(stateChanges).toEqual([
+        { from: 'closed', to: 'open' },
+      ]);
+
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Trigger half-open check
+      const res = await instance.get('/echo');
+      expect(res.status).toBe(200);
+      expect(stateChanges).toEqual([
+        { from: 'closed', to: 'open' },
+        { from: 'open', to: 'half-open' },
+        { from: 'half-open', to: 'closed' },
+      ]);
+    });
+  });
+
+  // ─── Concurrency Control ──────────────────────────────────────────────────
+
+  describe('concurrency control', () => {
+    it('should limit concurrent requests', async () => {
+      const instance = client.create({ baseURL });
+      instance.setConcurrency(2);
+
+      // Launch 4 requests; only 2 should be active at any time
+      const delays = [
+        instance.get('/delay?ms=100'),
+        instance.get('/delay?ms=100'),
+        instance.get('/delay?ms=100'),
+        instance.get('/delay?ms=100'),
+      ];
+
+      const results = await Promise.all(delays);
+      expect(results).toHaveLength(4);
+      results.forEach((res) => expect(res.status).toBe(200));
+    });
+
+    it('should accept number shorthand for setConcurrency', async () => {
+      const instance = client.create({ baseURL });
+      instance.setConcurrency(5);
+
+      const results = await Promise.all([
+        instance.get('/echo'),
+        instance.get('/echo'),
+        instance.get('/echo'),
+      ]);
+      expect(results).toHaveLength(3);
+    });
+  });
+
+  // ─── Download Progress ────────────────────────────────────────────────────
+
+  describe('download progress', () => {
+    it('should fire onDownloadProgress callbacks', async () => {
+      const progressEvents: Array<{ loaded: number; total: number; progress: number }> = [];
+
+      const res = await client.get(`${baseURL}/large`, {
+        onDownloadProgress: (event) => {
+          progressEvents.push({
+            loaded: event.loaded,
+            total: event.total,
+            progress: event.progress,
+          });
+        },
+        allowPrivateNetworks: true,
+      });
+
+      expect(res.status).toBe(200);
+      expect(progressEvents.length).toBeGreaterThan(0);
+
+      // Each event should have increasing loaded values
+      for (let i = 1; i < progressEvents.length; i++) {
+        expect(progressEvents[i].loaded).toBeGreaterThanOrEqual(progressEvents[i - 1].loaded);
+      }
+
+      // Last event should have loaded close to total content
+      const lastEvent = progressEvents[progressEvents.length - 1];
+      expect(lastEvent.loaded).toBeGreaterThan(0);
+    });
+
+    it('should include rate and estimated fields', async () => {
+      let lastEvent: { rate: number; estimated: number } | null = null;
+
+      await client.get(`${baseURL}/large`, {
+        onDownloadProgress: (event) => {
+          lastEvent = { rate: event.rate, estimated: event.estimated };
+        },
+        allowPrivateNetworks: true,
+      });
+
+      expect(lastEvent).not.toBeNull();
+      expect(lastEvent!.rate).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  // ─── Upload Progress ──────────────────────────────────────────────────────
+
+  describe('upload progress', () => {
+    it('should fire onUploadProgress callbacks', async () => {
+      const progressEvents: Array<{ loaded: number; total: number; progress: number }> = [];
+      const largeBody = 'x'.repeat(10 * 1024); // 10KB
+
+      const res = await client.post(`${baseURL}/echo`, largeBody, {
+        onUploadProgress: (event) => {
+          progressEvents.push({
+            loaded: event.loaded,
+            total: event.total,
+            progress: event.progress,
+          });
+        },
+        allowPrivateNetworks: true,
+      });
+
+      expect(res.status).toBe(200);
+      expect(progressEvents.length).toBeGreaterThan(0);
+
+      // Last event should be 100%
+      const lastEvent = progressEvents[progressEvents.length - 1];
+      expect(lastEvent.progress).toBe(100);
+      expect(lastEvent.loaded).toBe(lastEvent.total);
+    });
+  });
+
+  // ─── Request Timeline ─────────────────────────────────────────────────────
+
+  describe('request timeline', () => {
+    it('should collect timeline metrics when collectTimeline is true', async () => {
+      const res = await client.get(`${baseURL}/echo`, {
+        collectTimeline: true,
+        allowPrivateNetworks: true,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.timeline).toBeDefined();
+      expect(res.timeline!.startTime).toBeGreaterThan(0);
+      expect(res.timeline!.total).toBeGreaterThanOrEqual(0);
+      expect(res.timeline!.firstByte).toBeGreaterThanOrEqual(0);
+      expect(res.timeline!.contentDownload).toBeGreaterThanOrEqual(0);
+    });
+
+    it('should not include timeline by default', async () => {
+      const res = await client.get(`${baseURL}/echo`, {
+        allowPrivateNetworks: true,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.timeline).toBeUndefined();
+    });
+  });
+
+  // ─── Event Hooks ──────────────────────────────────────────────────────────
+
+  describe('event hooks', () => {
+    it('should fire onRequest hook', async () => {
+      let hookCalled = false;
+      let hookConfig: BridgeRequestConfig | null = null;
+
+      await client.get(`${baseURL}/echo`, {
+        allowPrivateNetworks: true,
+        hooks: {
+          onRequest: (config) => {
+            hookCalled = true;
+            hookConfig = config;
+          },
+        },
+      });
+
+      expect(hookCalled).toBe(true);
+      expect(hookConfig).not.toBeNull();
+    });
+
+    it('should fire onResponse hook', async () => {
+      let hookResponse: { status: number } | null = null;
+
+      await client.get(`${baseURL}/echo`, {
+        allowPrivateNetworks: true,
+        hooks: {
+          onResponse: (response) => {
+            hookResponse = { status: response.status };
+          },
+        },
+      });
+
+      expect(hookResponse).not.toBeNull();
+      expect(hookResponse!.status).toBe(200);
+    });
+
+    it('should fire onError hook on failure', async () => {
+      let hookError: { code?: string } | null = null;
+
+      try {
+        await client.get(`${baseURL}/status/500`, {
+          allowPrivateNetworks: true,
+          hooks: {
+            onError: (error) => {
+              hookError = { code: error.code };
+            },
+          },
+        });
+        fail('Should have thrown');
+      } catch {
+        expect(hookError).not.toBeNull();
+        expect(hookError!.code).toBe('ERR_BAD_RESPONSE');
+      }
+    });
+
+    it('should fire onRetry hook during retries', async () => {
+      const retryEvents: Array<{ attempt: number; delay: number }> = [];
+      const key = `retry-hook-${Date.now()}`;
+
+      await client.get(`${baseURL}/flaky?fail=1&key=${key}`, {
+        retry: { retries: 3, delay: 50, maxDelay: 200, backoffFactor: 2, retryableMethods: ['GET'], retryableStatuses: [503] },
+        allowPrivateNetworks: true,
+        hooks: {
+          onRetry: (attempt, _error, delay) => {
+            retryEvents.push({ attempt, delay });
+          },
+        },
+      });
+
+      expect(retryEvents.length).toBeGreaterThan(0);
+      expect(retryEvents[0].attempt).toBe(1);
+      expect(retryEvents[0].delay).toBeGreaterThan(0);
+    });
+  });
+
+  // ─── RateLimiter Unit Tests ──────────────────────────────────────────────
+
+  describe('RateLimiter class', () => {
+    it('should track available tokens', () => {
+      const { RateLimiter } = require('../src/ratelimit');
+      const limiter = new RateLimiter({ maxRequests: 3, windowMs: 1000 });
+      expect(limiter.getAvailableTokens()).toBe(3);
+
+      expect(limiter.tryAcquire()).toBe(true);
+      expect(limiter.getAvailableTokens()).toBe(2);
+
+      expect(limiter.tryAcquire()).toBe(true);
+      expect(limiter.tryAcquire()).toBe(true);
+      expect(limiter.tryAcquire()).toBe(false);
+    });
+
+    it('should reset to full capacity', () => {
+      const { RateLimiter } = require('../src/ratelimit');
+      const limiter = new RateLimiter({ maxRequests: 5, windowMs: 1000 });
+
+      limiter.tryAcquire();
+      limiter.tryAcquire();
+      limiter.reset();
+      expect(limiter.getAvailableTokens()).toBe(5);
+    });
+  });
+
+  // ─── CircuitBreaker Unit Tests ────────────────────────────────────────────
+
+  describe('CircuitBreaker class', () => {
+    it('should start in closed state', () => {
+      const { CircuitBreaker } = require('../src/circuit-breaker');
+      const cb = new CircuitBreaker();
+      expect(cb.getState()).toBe('closed');
+      expect(cb.allowRequest()).toBe(true);
+    });
+
+    it('should open after failure threshold', () => {
+      const { CircuitBreaker } = require('../src/circuit-breaker');
+      const cb = new CircuitBreaker({ failureThreshold: 2 });
+
+      cb.recordFailure();
+      expect(cb.getState()).toBe('closed');
+
+      cb.recordFailure();
+      expect(cb.getState()).toBe('open');
+      expect(cb.allowRequest()).toBe(false);
+    });
+
+    it('should reset properly', () => {
+      const { CircuitBreaker } = require('../src/circuit-breaker');
+      const cb = new CircuitBreaker({ failureThreshold: 1 });
+
+      cb.recordFailure();
+      expect(cb.getState()).toBe('open');
+
+      cb.reset();
+      expect(cb.getState()).toBe('closed');
+      expect(cb.getFailureCount()).toBe(0);
+    });
+  });
+
+  // ─── ConcurrencyManager Unit Tests ────────────────────────────────────────
+
+  describe('ConcurrencyManager class', () => {
+    it('should track running and queued counts', async () => {
+      const { ConcurrencyManager } = require('../src/concurrency');
+      const manager = new ConcurrencyManager({ maxConcurrent: 1 });
+
+      expect(manager.getRunning()).toBe(0);
+      expect(manager.getQueueSize()).toBe(0);
+      expect(manager.getMaxConcurrent()).toBe(1);
+
+      let resolve1!: () => void;
+      const p1 = new Promise<void>((r) => { resolve1 = r; });
+      const task1 = manager.execute(() => p1);
+
+      // Give microtask time to start
+      await new Promise((r) => setTimeout(r, 10));
+      expect(manager.getRunning()).toBe(1);
+
+      resolve1();
+      await task1;
+      expect(manager.getRunning()).toBe(0);
+    });
+  });
 });

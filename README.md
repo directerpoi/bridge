@@ -22,6 +22,15 @@ Bridge is a zero-dependency HTTP client with an axios-compatible API. Drop-in re
 - **🔒 HTTPS Enforcement** — option to reject all non-HTTPS requests
 - **📝 TypeScript** — full type definitions included
 
+### v4.0.0 — New Features
+
+- **🚦 Rate Limiting** — built-in token bucket rate limiter to control request throughput
+- **⚡ Circuit Breaker** — fault tolerance with open/half-open/closed states to prevent cascading failures
+- **🔀 Concurrency Control** — limit maximum parallel requests with automatic queuing
+- **📊 Progress Events** — upload and download progress callbacks with rate and ETA estimation
+- **⏱️ Request Timeline** — detailed timing metrics (DNS, TCP, TLS, TTFB, download, total)
+- **🪝 Event Hooks** — lifecycle hooks (`onRequest`, `onResponse`, `onError`, `onRetry`)
+
 ## 📦 Installation
 
 ```bash
@@ -120,6 +129,21 @@ const users = await api.get('/users');
 
   // Observability
   requestId: true,               // auto-inject X-Request-ID (UUID v4)
+
+  // v4.0.0: Progress Events
+  onUploadProgress: (event) => console.log(`Upload: ${event.progress}%`),
+  onDownloadProgress: (event) => console.log(`Download: ${event.progress}%`),
+
+  // v4.0.0: Request Timeline
+  collectTimeline: true,         // collect timing metrics
+
+  // v4.0.0: Event Hooks
+  hooks: {
+    onRequest: (config) => console.log('Request started:', config.url),
+    onResponse: (res) => console.log('Response:', res.status),
+    onError: (err) => console.error('Error:', err.message),
+    onRetry: (attempt, err, delay) => console.log(`Retry #${attempt} in ${delay}ms`),
+  },
 }
 ```
 
@@ -132,6 +156,15 @@ const users = await api.get('/users');
   statusText: 'OK',  // HTTP status text
   headers: {},       // Response headers
   config: {},        // Request config
+  timeline: {        // v4.0.0: Only when collectTimeline: true
+    startTime: 1713420166717,
+    dnsLookup: 5,
+    tcpConnect: 12,
+    tlsHandshake: 25,
+    firstByte: 42,
+    contentDownload: 8,
+    total: 50,
+  },
 }
 ```
 
@@ -418,6 +451,185 @@ Beyond basic private IP ranges, Bridge also blocks:
 - Multicast & reserved ranges (224.0.0.0/4, 240.0.0.0/4)
 - IPv6 multicast (ff00::/8)
 
+## 🚦 Rate Limiting
+
+Control request throughput with a built-in token bucket rate limiter:
+
+```typescript
+const api = bridge.create({ baseURL: 'https://api.example.com' });
+
+// Allow max 10 requests per second
+api.setRateLimiter({ maxRequests: 10, windowMs: 1000 });
+
+// Requests exceeding the limit are automatically queued and delayed
+const results = await Promise.all([
+  api.get('/data/1'),
+  api.get('/data/2'),
+  api.get('/data/3'),
+  // ...more requests — they'll be paced automatically
+]);
+
+// Use defaults (10 req/s)
+api.setRateLimiter(true);
+
+// Disable rate limiting
+api.setRateLimiter(false);
+```
+
+You can also use the `RateLimiter` class standalone:
+
+```typescript
+import { RateLimiter } from 'bridge';
+
+const limiter = new RateLimiter({ maxRequests: 5, windowMs: 1000 });
+console.log(limiter.getAvailableTokens()); // 5
+limiter.tryAcquire(); // true — immediate
+await limiter.acquire(); // waits if necessary
+limiter.reset(); // refill all tokens
+```
+
+## ⚡ Circuit Breaker
+
+Prevent cascading failures with the circuit breaker pattern:
+
+```typescript
+const api = bridge.create({ baseURL: 'https://api.example.com' });
+
+api.setCircuitBreaker({
+  failureThreshold: 5,    // open after 5 consecutive failures
+  resetTimeout: 30000,    // try again after 30s
+  halfOpenRequests: 1,    // allow 1 test request in half-open state
+  onStateChange: (from, to) => {
+    console.log(`Circuit: ${from} → ${to}`);
+  },
+});
+
+// Check circuit state
+console.log(api.getCircuitState()); // 'closed' | 'open' | 'half-open'
+
+try {
+  await api.get('/data');
+} catch (err) {
+  if (err.code === 'ERR_CIRCUIT_OPEN') {
+    console.log('Service is down — circuit is open');
+  }
+}
+```
+
+**Circuit breaker states:**
+- **closed** — normal operation, requests flow through
+- **open** — requests are immediately rejected (fast-fail) after too many failures
+- **half-open** — limited requests allowed to test if the service has recovered
+
+## 🔀 Concurrency Control
+
+Limit the number of parallel requests with automatic queuing:
+
+```typescript
+const api = bridge.create({ baseURL: 'https://api.example.com' });
+
+// Allow max 5 concurrent requests
+api.setConcurrency(5);
+
+// Or with config object
+api.setConcurrency({ maxConcurrent: 5 });
+
+// Launch 20 requests — only 5 run at a time, rest are queued
+const results = await Promise.all(
+  ids.map(id => api.get(`/users/${id}`))
+);
+```
+
+## 📊 Progress Events
+
+Track upload and download progress with detailed metrics:
+
+```typescript
+// Download progress
+const res = await bridge.get('https://api.example.com/large-file', {
+  onDownloadProgress: (event) => {
+    console.log(`Downloaded: ${event.loaded} bytes`);
+    console.log(`Total: ${event.total} bytes`);
+    console.log(`Progress: ${event.progress}%`);
+    console.log(`Speed: ${(event.rate / 1024).toFixed(1)} KB/s`);
+    console.log(`ETA: ${event.estimated}ms`);
+  },
+});
+
+// Upload progress
+await bridge.post('https://api.example.com/upload', largePayload, {
+  onUploadProgress: (event) => {
+    console.log(`Uploaded: ${event.progress}%`);
+    console.log(`Rate: ${(event.rate / 1024 / 1024).toFixed(1)} MB/s`);
+  },
+});
+```
+
+**Progress event shape:**
+```typescript
+{
+  loaded: number;    // bytes transferred so far
+  total: number;     // total bytes (0 if unknown)
+  progress: number;  // 0-100 percentage (-1 if unknown)
+  rate: number;      // bytes per second
+  estimated: number; // estimated time remaining in ms
+}
+```
+
+## ⏱️ Request Timeline
+
+Collect detailed timing metrics for every phase of the request:
+
+```typescript
+const res = await bridge.get('https://api.example.com/data', {
+  collectTimeline: true,
+});
+
+console.log(res.timeline);
+// {
+//   startTime: 1713420166717,  // Unix timestamp
+//   dnsLookup: 5,              // DNS resolution (ms)
+//   tcpConnect: 12,            // TCP connection (ms)
+//   tlsHandshake: 25,          // TLS handshake (ms, 0 for HTTP)
+//   firstByte: 42,             // Time to first byte (ms)
+//   contentDownload: 8,        // Content download (ms)
+//   total: 50,                 // Total duration (ms)
+// }
+```
+
+## 🪝 Event Hooks
+
+Subscribe to request lifecycle events for logging, monitoring, or custom logic:
+
+```typescript
+const api = bridge.create({
+  hooks: {
+    onRequest: (config) => {
+      console.log(`→ ${config.method} ${config.url}`);
+    },
+    onResponse: (response) => {
+      console.log(`← ${response.status} (${response.timeline?.total}ms)`);
+    },
+    onError: (error) => {
+      console.error(`✗ ${error.code}: ${error.message}`);
+    },
+    onRetry: (attempt, error, delay) => {
+      console.warn(`↻ Retry #${attempt} in ${delay}ms (${error.code})`);
+    },
+  },
+});
+```
+
+Hooks can also be set per-request:
+
+```typescript
+await api.get('/data', {
+  hooks: {
+    onResponse: (res) => metrics.record(res.timeline),
+  },
+});
+```
+
 ## 🔄 Migrating from Axios
 
 Bridge is designed as a drop-in replacement for axios:
@@ -465,6 +677,12 @@ const { data } = await api.get('/users');
 | Content size limits | ❌ | ✅ |
 | TLS version enforcement | ❌ | ✅ |
 | Custom cipher suites | ❌ | ✅ |
+| Rate limiting | ❌ | ✅ |
+| Circuit breaker | ❌ | ✅ |
+| Concurrency control | ❌ | ✅ |
+| Progress events | ❌ | ✅ |
+| Request timeline/metrics | ❌ | ✅ |
+| Event hooks | ❌ | ✅ |
 
 ## 📄 License
 
