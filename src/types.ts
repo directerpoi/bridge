@@ -2,6 +2,8 @@
 
 import type { RequestTimeline } from './timeline';
 import type { CircuitState } from './circuit-breaker';
+import type { RequestSigningConfig } from './signing';
+import type { CacheConfig } from './cache';
 
 export type Method =
   | 'get' | 'GET'
@@ -149,6 +151,18 @@ export interface BridgeRequestConfig {
   /** Allow HTTPS to HTTP downgrade on redirects (default: false — blocks downgrade) */
   allowHttpsDowngrade?: boolean;
 
+  // ─── v6.0.0 Security Features ──────────────────────────────────────────────
+  /** Expected SHA-256 hash of the response body. If set, response integrity is verified. */
+  expectedHash?: string;
+  /** HMAC request signing configuration. Signs outgoing requests with HMAC. */
+  requestSigning?: RequestSigningConfig;
+  /** Expected Content-Type of the response. If set, response Content-Type is validated (prefix match). */
+  expectedContentType?: string;
+  /** Auto-inject an Idempotency-Key header. Pass true for auto-generated UUID, or a string for a custom key. */
+  idempotencyKey?: boolean | string;
+  /** Respect Retry-After headers from server responses during retry (default: true when retry is enabled) */
+  respectRetryAfter?: boolean;
+
   // Retry options
   /** Enable automatic retry with exponential backoff. Pass true for defaults or a RetryConfig. */
   retry?: boolean | Partial<RetryConfig>;
@@ -254,6 +268,14 @@ export interface BridgeInstance {
   setConcurrency(config: number | Partial<ConcurrencyConfig>): void;
   /** Get the circuit breaker state (returns null if not enabled) */
   getCircuitState(): CircuitState | null;
+
+  // ─── v6.0.0 Instance Methods ─────────────────────────────────────────────
+  /** Set a response cache on this instance. Pass false to disable. */
+  setCache(config: boolean | Partial<CacheConfig>): void;
+  /** Clear the response cache. */
+  clearCache(): void;
+  /** Enable or disable request deduplication. */
+  setDeduplication(enabled: boolean): void;
 }
 
 export interface InterceptorManager<V> {
@@ -284,6 +306,14 @@ export interface BridgeStatic extends BridgeInstance {
   setConcurrency(config: number | Partial<ConcurrencyConfig>): void;
   /** Get the circuit breaker state (returns null if not enabled) */
   getCircuitState(): CircuitState | null;
+
+  // ─── v6.0.0 Instance Methods ─────────────────────────────────────────────
+  /** Set a response cache on this instance. Pass false to disable. */
+  setCache(config: boolean | Partial<CacheConfig>): void;
+  /** Clear the response cache. */
+  clearCache(): void;
+  /** Enable or disable request deduplication. */
+  setDeduplication(enabled: boolean): void;
 }
 
 export interface CancelTokenStatic {
