@@ -2562,11 +2562,15 @@ describe('bridge', () => {
     it('should evict LRU entries when maxSize is reached', async () => {
       const { DNSCache } = require('../src/dns-cache');
       const cache = new DNSCache({ maxSize: 1, ttl: 60000 });
-      await cache.lookup('127.0.0.1');
-      await cache.lookup('::1');
-      // Only the most recent should be cached (maxSize 1)
-      // IPs are returned directly, not cached from DNS
-      // Let's use a different approach
+      // Use actual hostnames that require DNS resolution
+      await cache.lookup('localhost');
+      expect(cache.has('localhost')).toBe(true);
+      // Lookup another hostname — should evict 'localhost' since maxSize is 1
+      // Use the loopback address name which also resolves
+      await cache.lookup('ip6-localhost').catch(() => {
+        // ip6-localhost may not resolve on all systems, that's OK
+      });
+      // Regardless, maxSize should be respected
       expect(cache.size).toBeLessThanOrEqual(1);
     });
   });
