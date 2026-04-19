@@ -231,10 +231,10 @@ export class Bridge {
       // v9.0.0: Try circuit breaker fallback first, then request-level fallback
       const cbFallback = this.circuitBreaker.getFallback();
       if (cbFallback) {
-        return cbFallback(circuitError) as Promise<BridgeResponse<T>>;
+        return Promise.resolve(cbFallback(circuitError)) as Promise<BridgeResponse<T>>;
       }
       if (finalConfig.fallback) {
-        return finalConfig.fallback(circuitError) as Promise<BridgeResponse<T>>;
+        return Promise.resolve(finalConfig.fallback(circuitError)) as Promise<BridgeResponse<T>>;
       }
       throw circuitError;
     }
@@ -433,7 +433,7 @@ export class Bridge {
     if (finalConfig.fallback) {
       const requestFallback = finalConfig.fallback;
       resultPromise = resultPromise.catch((err) => {
-        return requestFallback(err as Error) as BridgeResponse<T>;
+        return Promise.resolve(requestFallback(err as Error)) as Promise<BridgeResponse<T>>;
       });
     }
 

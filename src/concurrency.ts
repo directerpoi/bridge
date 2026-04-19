@@ -63,7 +63,7 @@ export class ConcurrencyManager {
               this.queue.splice(idx, 1);
               queuedRequest.reject(
                 new Error(
-                  `Request queued for ${this.config.queueTimeout}ms exceeded queue timeout. ` +
+                  `Request exceeded queue timeout of ${this.config.queueTimeout}ms. ` +
                   `Queue depth: ${this.queue.length}, running: ${this.running}/${this.config.maxConcurrent}`
                 )
               );
