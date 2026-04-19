@@ -1,8 +1,14 @@
 # 🌉 Bridge
 
+[![npm version](https://img.shields.io/npm/v/@awsibnj/bridge.svg)](https://www.npmjs.com/package/@awsibnj/bridge)
+[![license](https://img.shields.io/npm/l/@awsibnj/bridge.svg)](https://github.com/directerpoi/bridge/blob/main/LICENSE)
+[![node](https://img.shields.io/node/v/@awsibnj/bridge.svg)](https://nodejs.org)
+
 **A powerful, secure, and lightning-fast HTTP client for Node.js.**
 
 Bridge is a zero-dependency HTTP client with an axios-compatible API. Drop-in replacement with enhanced security features, automatic compression, and full TypeScript support.
+
+> **Package name:** [`@awsibnj/bridge`](https://www.npmjs.com/package/@awsibnj/bridge)
 
 ## ✨ Features
 
@@ -46,16 +52,32 @@ Bridge is a zero-dependency HTTP client with an axios-compatible API. Drop-in re
 - **⏱️ Request Timeline** — detailed timing metrics (DNS, TCP, TLS, TTFB, download, total)
 - **🪝 Event Hooks** — lifecycle hooks (`onRequest`, `onResponse`, `onError`, `onRetry`)
 
+## 📦 Prerequisites
+
+- **Node.js** >= 18.0.0
+
 ## 📦 Installation
 
 ```bash
-npm install bridge
+npm install @awsibnj/bridge
+```
+
+Or with Yarn:
+
+```bash
+yarn add @awsibnj/bridge
+```
+
+Or with pnpm:
+
+```bash
+pnpm add @awsibnj/bridge
 ```
 
 ## 🚀 Quick Start
 
 ```typescript
-import bridge from 'bridge';
+import bridge from '@awsibnj/bridge';
 
 // GET request
 const response = await bridge.get('https://api.example.com/users');
@@ -66,6 +88,12 @@ const { data } = await bridge.post('https://api.example.com/users', {
   name: 'John',
   email: 'john@example.com',
 });
+```
+
+CommonJS:
+
+```javascript
+const bridge = require('@awsibnj/bridge');
 ```
 
 ## 📖 API
@@ -220,7 +248,7 @@ bridge.get('/users', { signal: controller.signal });
 controller.abort();
 
 // Using CancelToken (axios compatibility)
-import { CancelToken } from 'bridge';
+import { CancelToken } from '@awsibnj/bridge';
 const source = CancelToken.source();
 bridge.get('/users', { signal: source.token });
 source.cancel('Operation cancelled');
@@ -229,7 +257,7 @@ source.cancel('Operation cancelled');
 ### Error Handling
 
 ```typescript
-import { isBridgeError } from 'bridge';
+import { isBridgeError } from '@awsibnj/bridge';
 
 try {
   await bridge.get('https://api.example.com/users');
@@ -554,7 +582,7 @@ api.setRateLimiter(false);
 You can also use the `RateLimiter` class standalone:
 
 ```typescript
-import { RateLimiter } from 'bridge';
+import { RateLimiter } from '@awsibnj/bridge';
 
 const limiter = new RateLimiter({ maxRequests: 5, windowMs: 1000 });
 console.log(limiter.getAvailableTokens()); // 5
@@ -711,7 +739,7 @@ Bridge is designed as a drop-in replacement for axios:
 
 ```diff
 - import axios from 'axios';
-+ import bridge from 'bridge';
++ import bridge from '@awsibnj/bridge';
 
 - const api = axios.create({ baseURL: 'https://api.example.com' });
 + const api = bridge.create({ baseURL: 'https://api.example.com' });
@@ -764,4 +792,4 @@ const { data } = await api.get('/users');
 
 ## 📄 License
 
-MIT
+[MIT](./LICENSE) © bridge contributors
