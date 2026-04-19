@@ -222,11 +222,21 @@ export class Bridge {
 
     // Circuit breaker check
     if (this.circuitBreaker && !this.circuitBreaker.allowRequest()) {
-      throw createError(
+      const circuitError = createError(
         'Circuit breaker is open — request rejected',
         finalConfig,
         'ERR_CIRCUIT_OPEN'
       );
+
+      // v9.0.0: Try circuit breaker fallback first, then request-level fallback
+      const cbFallback = this.circuitBreaker.getFallback();
+      if (cbFallback) {
+        return Promise.resolve(cbFallback(circuitError)) as Promise<BridgeResponse<T>>;
+      }
+      if (finalConfig.fallback) {
+        return Promise.resolve(finalConfig.fallback(circuitError)) as Promise<BridgeResponse<T>>;
+      }
+      throw circuitError;
     }
 
     // Rate limiting
@@ -398,21 +408,36 @@ export class Bridge {
     // v6.0.0: Wrap with deduplication if enabled
     const executeWithConcurrency = (): Promise<BridgeResponse<T>> => {
       if (this.concurrencyManager) {
-        return this.concurrencyManager.execute(executeInternal);
+        // v9.0.0: Pass priority from config to concurrency manager
+        const priority = finalConfig.priority ?? 0;
+        return this.concurrencyManager.execute(executeInternal, priority);
       }
       return executeInternal();
     };
 
     // v6.0.0: Deduplication — only for safe/idempotent methods
+    let resultPromise: Promise<BridgeResponse<T>>;
     if (this.deduplicator && ['GET', 'HEAD', 'OPTIONS'].includes(method)) {
       const dedupKey = RequestDeduplicator.key(method, fullURL);
-      return this.deduplicator.execute(
+      resultPromise = this.deduplicator.execute(
         dedupKey,
         executeWithConcurrency
       ) as Promise<BridgeResponse<T>>;
+    } else {
+      resultPromise = executeWithConcurrency();
     }
 
-    return executeWithConcurrency();
+    // v9.0.0: Apply request-level fallback for any error in the pipeline
+    // (covers queue timeout, middleware errors, and other bridge-layer errors
+    //  that the adapter-level fallback wouldn't catch)
+    if (finalConfig.fallback) {
+      const requestFallback = finalConfig.fallback;
+      resultPromise = resultPromise.catch((err) => {
+        return Promise.resolve(requestFallback(err as Error)) as Promise<BridgeResponse<T>>;
+      });
+    }
+
+    return resultPromise;
   }
 
   /**

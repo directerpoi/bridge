@@ -3260,4 +3260,290 @@ describe('bridge', () => {
       expect(typeof normalizeHostname).toBe('function');
     });
   });
+
+  // ─── v9.0.0 Resilience Features ──────────────────────────────────────────
+
+  describe('totalTimeout', () => {
+    it('should reject when total timeout expires during retries', async () => {
+      const key = `total-timeout-${Date.now()}`;
+      try {
+        await client.get(`${baseURL}/flaky?fail=5&key=${key}`, {
+          retry: { retries: 5, delay: 200, maxDelay: 2000, backoffFactor: 2, retryableMethods: ['GET'], retryableStatuses: [503] },
+          totalTimeout: 300,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        const error = err as { code?: string; message?: string };
+        expect(error.code).toBe('ERR_TOTAL_TIMEOUT');
+        expect(error.message).toContain('Total timeout');
+      }
+    });
+
+    it('should succeed when total timeout is generous enough', async () => {
+      const key = `total-timeout-ok-${Date.now()}`;
+      const res = await client.get(`${baseURL}/flaky?fail=1&key=${key}`, {
+        retry: { retries: 3, delay: 50, maxDelay: 200, backoffFactor: 1, retryableMethods: ['GET'], retryableStatuses: [503] },
+        totalTimeout: 5000,
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it('should not affect requests without retries', async () => {
+      const res = await client.get(`${baseURL}/echo`, {
+        totalTimeout: 5000,
+      });
+      expect(res.status).toBe(200);
+    });
+  });
+
+  describe('fallback', () => {
+    it('should return fallback response when request fails', async () => {
+      const fallbackData = { fallback: true, message: 'service unavailable' };
+      const res = await client.get(`${baseURL}/status/500`, {
+        fallback: () => ({
+          data: fallbackData,
+          status: 200,
+          statusText: 'OK (fallback)',
+          headers: {},
+          config: {},
+        }),
+      });
+      expect(res.data).toEqual(fallbackData);
+      expect(res.statusText).toBe('OK (fallback)');
+    });
+
+    it('should return fallback when totalTimeout fires', async () => {
+      const key = `fallback-timeout-${Date.now()}`;
+      const res = await client.get(`${baseURL}/flaky?fail=10&key=${key}`, {
+        retry: { retries: 10, delay: 200, maxDelay: 2000, backoffFactor: 2, retryableMethods: ['GET'], retryableStatuses: [503] },
+        totalTimeout: 200,
+        fallback: (err) => ({
+          data: { degraded: true, reason: err.message },
+          status: 503,
+          statusText: 'Fallback',
+          headers: {},
+          config: {},
+        }),
+      });
+      expect((res.data as Record<string, unknown>).degraded).toBe(true);
+    });
+
+    it('should not invoke fallback when request succeeds', async () => {
+      const fallbackFn = jest.fn();
+      const res = await client.get(`${baseURL}/echo`, {
+        fallback: fallbackFn,
+      });
+      expect(res.status).toBe(200);
+      expect(fallbackFn).not.toHaveBeenCalled();
+    });
+
+    it('should support async fallback', async () => {
+      const res = await client.get(`${baseURL}/status/500`, {
+        fallback: async () => {
+          // Simulate async fallback (e.g., reading from cache)
+          return {
+            data: { fromCache: true },
+            status: 200,
+            statusText: 'OK',
+            headers: {},
+            config: {},
+          };
+        },
+      });
+      expect((res.data as Record<string, unknown>).fromCache).toBe(true);
+    });
+  });
+
+  describe('circuit breaker fallback', () => {
+    it('should return fallback response when circuit is open', async () => {
+      const inst = create({ allowPrivateNetworks: true });
+      inst.setCircuitBreaker({
+        failureThreshold: 2,
+        resetTimeout: 60000,
+        halfOpenRequests: 1,
+        fallback: () => ({
+          data: { circuitFallback: true },
+          status: 200,
+          statusText: 'OK (circuit fallback)',
+          headers: {},
+          config: {},
+        }),
+      });
+
+      // Trigger failures to open the circuit
+      for (let i = 0; i < 2; i++) {
+        try {
+          await inst.get(`${baseURL}/status/500`);
+        } catch { /* expected */ }
+      }
+
+      // Circuit should be open; fallback should be returned
+      const res = await inst.get(`${baseURL}/echo`);
+      expect((res.data as Record<string, unknown>).circuitFallback).toBe(true);
+      expect(res.statusText).toBe('OK (circuit fallback)');
+    });
+
+    it('should use request-level fallback when circuit breaker has no fallback', async () => {
+      const inst = create({ allowPrivateNetworks: true });
+      inst.setCircuitBreaker({
+        failureThreshold: 2,
+        resetTimeout: 60000,
+        halfOpenRequests: 1,
+      });
+
+      // Trigger failures to open the circuit
+      for (let i = 0; i < 2; i++) {
+        try {
+          await inst.get(`${baseURL}/status/500`);
+        } catch { /* expected */ }
+      }
+
+      // Circuit should be open; request-level fallback should be used
+      const res = await inst.get(`${baseURL}/echo`, {
+        fallback: () => ({
+          data: { requestFallback: true },
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          config: {},
+        }),
+      });
+      expect((res.data as Record<string, unknown>).requestFallback).toBe(true);
+    });
+  });
+
+  describe('concurrency queue timeout', () => {
+    it('should reject requests that wait too long in the queue', async () => {
+      const inst = create({ allowPrivateNetworks: true });
+      inst.setConcurrency({ maxConcurrent: 1, queueTimeout: 100 });
+
+      // First request: occupies the single slot for 500ms
+      const slow = inst.get(`${baseURL}/delay?ms=500`);
+
+      // Second request: queued, should time out after 100ms
+      let timedOut = false;
+      try {
+        await inst.get(`${baseURL}/echo`);
+      } catch (err: unknown) {
+        timedOut = true;
+        expect((err as Error).message).toContain('queue timeout');
+      }
+      expect(timedOut).toBe(true);
+
+      // Wait for the first request to complete
+      await slow;
+    });
+
+    it('should not timeout when queue is fast enough', async () => {
+      const inst = create({ allowPrivateNetworks: true });
+      inst.setConcurrency({ maxConcurrent: 1, queueTimeout: 5000 });
+
+      // First request: fast
+      const p1 = inst.get(`${baseURL}/echo`);
+      // Second request: queued but queue clears quickly
+      const p2 = inst.get(`${baseURL}/echo`);
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(r1.status).toBe(200);
+      expect(r2.status).toBe(200);
+    });
+  });
+
+  describe('concurrency priority queue', () => {
+    it('should process higher priority requests first', async () => {
+      const inst = create({ allowPrivateNetworks: true });
+      inst.setConcurrency({ maxConcurrent: 1 });
+
+      const order: string[] = [];
+
+      // First: occupies the slot
+      const p1 = inst.get(`${baseURL}/delay?ms=100`).then(() => {
+        order.push('first');
+      });
+
+      // These will be queued
+      const pLow = inst.get(`${baseURL}/echo`, { priority: 1 }).then(() => {
+        order.push('low');
+      });
+      const pHigh = inst.get(`${baseURL}/echo`, { priority: 10 }).then(() => {
+        order.push('high');
+      });
+      const pMed = inst.get(`${baseURL}/echo`, { priority: 5 }).then(() => {
+        order.push('medium');
+      });
+
+      await Promise.all([p1, pLow, pHigh, pMed]);
+
+      // First completes first (it was running), then queue is processed by priority
+      expect(order[0]).toBe('first');
+      expect(order[1]).toBe('high');
+      expect(order[2]).toBe('medium');
+      expect(order[3]).toBe('low');
+    });
+  });
+
+  describe('v9.0.0 combined resilience', () => {
+    it('should work with totalTimeout + retry + fallback together', async () => {
+      const key = `combined-${Date.now()}`;
+      const res = await client.get(`${baseURL}/flaky?fail=10&key=${key}`, {
+        retry: { retries: 10, delay: 100, maxDelay: 1000, backoffFactor: 2, retryableMethods: ['GET'], retryableStatuses: [503] },
+        totalTimeout: 300,
+        fallback: (err) => ({
+          data: { gracefullyDegraded: true },
+          status: 503,
+          statusText: 'Degraded',
+          headers: {},
+          config: {},
+        }),
+      });
+      expect((res.data as Record<string, unknown>).gracefullyDegraded).toBe(true);
+    });
+
+    it('should work with priority + concurrency + fallback', async () => {
+      const inst = create({ allowPrivateNetworks: true });
+      inst.setConcurrency({ maxConcurrent: 1, queueTimeout: 100 });
+
+      // Occupy the slot
+      const slow = inst.get(`${baseURL}/delay?ms=500`);
+
+      // This will timeout in queue, but fallback provides a response
+      const res = await inst.get(`${baseURL}/echo`, {
+        priority: 10,
+        fallback: () => ({
+          data: { queueFallback: true },
+          status: 200,
+          statusText: 'Queue Fallback',
+          headers: {},
+          config: {},
+        }),
+      });
+      expect((res.data as Record<string, unknown>).queueFallback).toBe(true);
+
+      await slow;
+    });
+  });
+
+  describe('ConcurrencyManager class (v9.0.0)', () => {
+    it('should support queueTimeout configuration', () => {
+      const { ConcurrencyManager } = require('../src/concurrency');
+      const mgr = new ConcurrencyManager({ maxConcurrent: 1, queueTimeout: 500 });
+      expect(mgr.getMaxConcurrent()).toBe(1);
+    });
+
+    it('should support priority ordering', async () => {
+      const { ConcurrencyManager } = require('../src/concurrency');
+      const mgr = new ConcurrencyManager({ maxConcurrent: 1 });
+      const order: number[] = [];
+
+      // Occupy the slot
+      const p0 = mgr.execute(() => new Promise(r => setTimeout(() => { order.push(0); r(0); }, 50)));
+      // Queue items with different priorities
+      const p1 = mgr.execute(() => new Promise(r => { order.push(1); r(1); }), 1);
+      const p3 = mgr.execute(() => new Promise(r => { order.push(3); r(3); }), 3);
+      const p2 = mgr.execute(() => new Promise(r => { order.push(2); r(2); }), 2);
+
+      await Promise.all([p0, p1, p2, p3]);
+      expect(order).toEqual([0, 3, 2, 1]);
+    });
+  });
 });

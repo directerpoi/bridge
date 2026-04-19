@@ -27,10 +27,49 @@ const MAX_PROGRESS_EVENTS = 100; // Maximum number of progress events during upl
 export function httpAdapter(config: BridgeRequestConfig): Promise<BridgeResponse> {
   const retryConfig = resolveRetryConfig(config);
 
-  if (retryConfig) {
-    return executeWithRetry(config, retryConfig);
+  // v9.0.0: Wrap everything in a totalTimeout if configured
+  const totalTimeout = config.totalTimeout;
+
+  const coreExecution = (): Promise<BridgeResponse> => {
+    if (retryConfig) {
+      return executeWithRetry(config, retryConfig);
+    }
+    return executeRequest(config);
+  };
+
+  if (totalTimeout && totalTimeout > 0) {
+    return new Promise<BridgeResponse>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(createError(
+            `Total timeout of ${totalTimeout}ms exceeded (covers entire request lifecycle including retries)`,
+            config,
+            'ERR_TOTAL_TIMEOUT'
+          ));
+        }
+      }, totalTimeout);
+
+      coreExecution()
+        .then((res) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(res);
+          }
+        })
+        .catch((err) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+          }
+        });
+    });
   }
-  return executeRequest(config);
+
+  return coreExecution();
 }
 
 async function executeWithRetry(

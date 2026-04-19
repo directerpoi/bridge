@@ -11,6 +11,9 @@ export interface CircuitBreakerConfig {
   halfOpenRequests: number;
   /** Optional callback when circuit state changes */
   onStateChange?: (from: CircuitState, to: CircuitState) => void;
+  /** Optional fallback function invoked when the circuit is open.
+   *  Return a BridgeResponse to gracefully degrade instead of throwing. */
+  fallback?: (error: Error) => unknown | Promise<unknown>;
 }
 
 const DEFAULT_CIRCUIT_BREAKER: CircuitBreakerConfig = {
@@ -140,6 +143,13 @@ export class CircuitBreaker {
    */
   getFailureCount(): number {
     return this.failureCount;
+  }
+
+  /**
+   * Returns the fallback function if configured, or null.
+   */
+  getFallback(): CircuitBreakerConfig['fallback'] | null {
+    return this.config.fallback || null;
   }
 }
 
