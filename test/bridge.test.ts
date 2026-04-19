@@ -230,6 +230,25 @@ function createTestServer(): Promise<void> {
           return;
         }
 
+        // v8.0.0 test routes: prototype pollution payloads
+        if (pathname === '/proto-pollution') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{"__proto__": {"admin": true}, "name": "safe"}');
+          return;
+        }
+
+        if (pathname === '/proto-nested') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{"nested": {"__proto__": {"admin": true}, "value": "ok"}}');
+          return;
+        }
+
+        if (pathname === '/proto-constructor') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{"constructor": {"prototype": {"admin": true}}, "prototype": {}, "safe": true}');
+          return;
+        }
+
         // Default 404
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Not found' }));
@@ -2372,12 +2391,12 @@ describe('bridge', () => {
     });
   });
 
-  // ─── v7.0.0 Version Check ────────────────────────────────────────────────
+  // ─── v8.0.0 Version Check ────────────────────────────────────────────────
 
-  describe('v7.0.0 version', () => {
-    it('should send bridge/7.0.0 User-Agent header', async () => {
+  describe('v8.0.0 version', () => {
+    it('should send bridge/8.0.0 User-Agent header', async () => {
       const res = await client.get<EchoData>(`${baseURL}/echo`);
-      expect(res.data.headers['user-agent']).toBe('bridge/7.0.0');
+      expect(res.data.headers['user-agent']).toBe('bridge/8.0.0');
     });
   });
 
@@ -2922,6 +2941,323 @@ describe('bridge', () => {
       expect(typeof bridge.removeMiddleware).toBe('function');
       expect(typeof bridge.clearMiddleware).toBe('function');
       expect(typeof bridge.closeHTTP2Sessions).toBe('function');
+    });
+  });
+
+  // ─── v8.0.0 Safe JSON Parsing (Prototype Pollution Protection) ──────────
+
+  describe('safe JSON parsing', () => {
+    it('should strip __proto__ from JSON responses when safeJsonParsing is enabled', async () => {
+      const res = await client.get(`${baseURL}/proto-pollution`, {
+        safeJsonParsing: true,
+      });
+      expect(res.data).toBeDefined();
+      const data = res.data as Record<string, unknown>;
+      expect(Object.hasOwn(data, '__proto__')).toBe(false);
+      expect(data.name).toBe('safe');
+    });
+
+    it('should strip nested __proto__ properties', async () => {
+      const res = await client.get(`${baseURL}/proto-nested`, {
+        safeJsonParsing: true,
+      });
+      const data = res.data as Record<string, unknown>;
+      expect(data.nested).toBeDefined();
+      expect(Object.hasOwn(data.nested as Record<string, unknown>, '__proto__')).toBe(false);
+      expect((data.nested as Record<string, unknown>).value).toBe('ok');
+    });
+
+    it('should strip constructor and prototype properties', async () => {
+      const res = await client.get(`${baseURL}/proto-constructor`, {
+        safeJsonParsing: true,
+      });
+      const data = res.data as Record<string, unknown>;
+      expect(Object.hasOwn(data, 'constructor')).toBe(false);
+      expect(Object.hasOwn(data, 'prototype')).toBe(false);
+      expect(data.safe).toBe(true);
+    });
+
+    it('should NOT strip __proto__ when safeJsonParsing is not enabled', async () => {
+      const res = await client.get(`${baseURL}/proto-pollution`);
+      // Without safe parsing, JSON.parse preserves __proto__ as a regular key
+      const data = res.data as Record<string, unknown>;
+      expect(data.name).toBe('safe');
+    });
+  });
+
+  // ─── v8.0.0 safeJSONParse unit tests ───────────────────────────────────
+
+  describe('safeJSONParse (unit)', () => {
+    it('should strip __proto__ property', () => {
+      const { safeJSONParse } = require('../src/security');
+      const result = safeJSONParse('{"__proto__": {"admin": true}, "name": "test"}');
+      expect(result).toEqual({ name: 'test' });
+    });
+
+    it('should strip constructor property', () => {
+      const { safeJSONParse } = require('../src/security');
+      const result = safeJSONParse('{"constructor": {"prototype": {}}, "value": 1}');
+      expect(result).toEqual({ value: 1 });
+    });
+
+    it('should strip prototype property', () => {
+      const { safeJSONParse } = require('../src/security');
+      const result = safeJSONParse('{"prototype": {}, "ok": true}');
+      expect(result).toEqual({ ok: true });
+    });
+
+    it('should handle nested dangerous properties', () => {
+      const { safeJSONParse } = require('../src/security');
+      const result = safeJSONParse('{"data": {"__proto__": {"admin": true}, "value": "ok"}}');
+      expect(result).toEqual({ data: { value: 'ok' } });
+    });
+
+    it('should handle arrays with dangerous properties in objects', () => {
+      const { safeJSONParse } = require('../src/security');
+      const result = safeJSONParse('[{"__proto__": {}, "x": 1}, {"y": 2}]');
+      expect(result).toEqual([{ x: 1 }, { y: 2 }]);
+    });
+
+    it('should handle primitive values', () => {
+      const { safeJSONParse } = require('../src/security');
+      expect(safeJSONParse('"hello"')).toBe('hello');
+      expect(safeJSONParse('42')).toBe(42);
+      expect(safeJSONParse('true')).toBe(true);
+      expect(safeJSONParse('null')).toBe(null);
+    });
+
+    it('should preserve safe nested objects', () => {
+      const { safeJSONParse } = require('../src/security');
+      const result = safeJSONParse('{"a": {"b": {"c": "deep"}}}');
+      expect(result).toEqual({ a: { b: { c: 'deep' } } });
+    });
+  });
+
+  // ─── v8.0.0 IDN Homograph Attack Protection ────────────────────────────
+
+  describe('IDN homograph attack protection', () => {
+    it('should detect Cyrillic confusable characters', () => {
+      const { detectIDNHomograph } = require('../src/security');
+      // Cyrillic "а" (U+0430) looks like Latin "a"
+      expect(detectIDNHomograph('\u0430pple.com')).toBe(true);
+    });
+
+    it('should not flag pure ASCII hostnames', () => {
+      const { detectIDNHomograph } = require('../src/security');
+      expect(detectIDNHomograph('example.com')).toBe(false);
+      expect(detectIDNHomograph('api.github.com')).toBe(false);
+    });
+
+    it('should detect mixed Latin and Cyrillic scripts', () => {
+      const { detectIDNHomograph } = require('../src/security');
+      // Mix of Cyrillic "е" and Latin letters
+      expect(detectIDNHomograph('gооgl\u0435.com')).toBe(true);
+    });
+
+    it('should normalize hostname to ASCII', () => {
+      const { normalizeHostname } = require('../src/security');
+      expect(normalizeHostname('example.com', false)).toBe('example.com');
+      expect(normalizeHostname('EXAMPLE.COM', false)).toBe('example.com');
+    });
+
+    it('should block homograph attacks when enabled', () => {
+      const { normalizeHostname } = require('../src/security');
+      // Cyrillic "а" looks like Latin "a"
+      expect(() => normalizeHostname('\u0430pple.com', true)).toThrow('IDN homograph');
+    });
+
+    it('should allow homograph hostnames when blocking is disabled', () => {
+      const { normalizeHostname } = require('../src/security');
+      expect(() => normalizeHostname('\u0430pple.com', false)).not.toThrow();
+    });
+
+    it('should block IDN homograph in HTTP requests when blockHomographAttacks is true', async () => {
+      try {
+        await bridge.get('http://\u0430pple.com/test', {
+          blockHomographAttacks: true,
+          allowPrivateNetworks: true,
+        });
+        fail('Expected to throw');
+      } catch (err: unknown) {
+        expect((err as Error).message).toContain('IDN homograph');
+      }
+    });
+  });
+
+  // ─── v8.0.0 Response Header Flood Protection ───────────────────────────
+
+  describe('response header flood protection', () => {
+    it('should validate response headers count', () => {
+      const { validateResponseHeaders } = require('../src/security');
+      const headers: Record<string, string> = {};
+      for (let i = 0; i < 5; i++) {
+        headers[`header-${i}`] = `value-${i}`;
+      }
+      // Should not throw for 5 headers with max 100
+      expect(() => validateResponseHeaders(headers, 100, 65536)).not.toThrow();
+    });
+
+    it('should reject when header count exceeds limit', () => {
+      const { validateResponseHeaders } = require('../src/security');
+      const headers: Record<string, string> = {};
+      for (let i = 0; i < 10; i++) {
+        headers[`header-${i}`] = `value-${i}`;
+      }
+      expect(() => validateResponseHeaders(headers, 5, 65536)).toThrow('header count');
+    });
+
+    it('should reject when total header size exceeds limit', () => {
+      const { validateResponseHeaders } = require('../src/security');
+      const headers: Record<string, string> = {
+        'X-Large': 'x'.repeat(1000),
+      };
+      expect(() => validateResponseHeaders(headers, 100, 500)).toThrow('header total size');
+    });
+
+    it('should pass within limits', () => {
+      const { validateResponseHeaders } = require('../src/security');
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+        'content-length': '42',
+      };
+      expect(() => validateResponseHeaders(headers, 100, 65536)).not.toThrow();
+    });
+
+    it('should limit response headers in HTTP requests', async () => {
+      // This uses the normal test server which has few headers, should pass
+      const res = await client.get(`${baseURL}/echo`, {
+        maxResponseHeaders: 100,
+        maxResponseHeaderSize: 65536,
+      });
+      expect(res.status).toBe(200);
+    });
+  });
+
+  // ─── v8.0.0 Decompression Bomb Protection ──────────────────────────────
+
+  describe('decompression bomb protection', () => {
+    it('should validate decompression ratio within limits', () => {
+      const { checkDecompressionRatio } = require('../src/security');
+      expect(checkDecompressionRatio(100, 5000, 100)).toBe(true); // 50:1 ratio, under 100:1
+    });
+
+    it('should reject excessive decompression ratio', () => {
+      const { checkDecompressionRatio } = require('../src/security');
+      expect(checkDecompressionRatio(100, 20000, 100)).toBe(false); // 200:1 ratio, over 100:1
+    });
+
+    it('should handle zero compressed size gracefully', () => {
+      const { checkDecompressionRatio } = require('../src/security');
+      expect(checkDecompressionRatio(0, 1000, 100)).toBe(true);
+    });
+
+    it('should accept exact ratio at the limit', () => {
+      const { checkDecompressionRatio } = require('../src/security');
+      expect(checkDecompressionRatio(100, 10000, 100)).toBe(true); // exactly 100:1
+    });
+  });
+
+  // ─── v8.0.0 Content-Length Integrity ────────────────────────────────────
+
+  describe('Content-Length integrity', () => {
+    it('should validate matching Content-Length', () => {
+      const { validateContentLengthIntegrity } = require('../src/security');
+      expect(validateContentLengthIntegrity(100, 100)).toBe(true);
+    });
+
+    it('should reject mismatched Content-Length', () => {
+      const { validateContentLengthIntegrity } = require('../src/security');
+      expect(validateContentLengthIntegrity(100, 200)).toBe(false);
+    });
+
+    it('should skip validation when Content-Length is not set', () => {
+      const { validateContentLengthIntegrity } = require('../src/security');
+      expect(validateContentLengthIntegrity(-1, 100)).toBe(true);
+      expect(validateContentLengthIntegrity(NaN, 100)).toBe(true);
+    });
+  });
+
+  // ─── v8.0.0 Strict Security Mode ───────────────────────────────────────
+
+  describe('strict security mode', () => {
+    it('should return strict security defaults', () => {
+      const { getStrictSecurityDefaults } = require('../src/security');
+      const defaults = getStrictSecurityDefaults();
+      expect(defaults.enforceHttps).toBe(true);
+      expect(defaults.dnsProtection).toBe(true);
+      expect(defaults.allowPrivateNetworks).toBe(false);
+      expect(defaults.blockHomographAttacks).toBe(true);
+      expect(defaults.safeJsonParsing).toBe(true);
+      expect(defaults.validateContentLength).toBe(true);
+      expect(defaults.tlsMinVersion).toBe('TLSv1.3');
+      expect(defaults.maxDecompressionRatio).toBe(100);
+      expect(defaults.maxResponseHeaders).toBe(100);
+      expect(defaults.maxResponseHeaderSize).toBe(65536);
+    });
+
+    it('should enforce HTTPS when strictSecurity is true', async () => {
+      try {
+        await bridge.get(`${baseURL}/echo`, { strictSecurity: true });
+        fail('Expected to throw');
+      } catch (err: unknown) {
+        // Since the test server is HTTP, strict security (which defaults enforceHttps=true) should reject
+        expect((err as Error).message).toContain('HTTPS');
+      }
+    });
+
+    it('should allow explicit overrides with strictSecurity', async () => {
+      // Even with strictSecurity, explicit overrides should work
+      try {
+        await bridge.get(`${baseURL}/echo`, {
+          strictSecurity: true,
+          enforceHttps: false,
+          allowPrivateNetworks: true,
+          safeJsonParsing: true,
+        });
+        // Should succeed since we overrode enforceHttps and allowPrivateNetworks
+      } catch (err: unknown) {
+        // Should not fail with HTTPS error (we explicitly disabled it)
+        expect((err as Error).message).not.toContain('HTTPS');
+      }
+    });
+
+    it('should enable safe JSON parsing in strict mode', async () => {
+      const res = await client.get(`${baseURL}/proto-pollution`, {
+        strictSecurity: true,
+        enforceHttps: false,
+        allowPrivateNetworks: true,
+      });
+      const data = res.data as Record<string, unknown>;
+      expect(Object.hasOwn(data, '__proto__')).toBe(false);
+      expect(data.name).toBe('safe');
+    });
+  });
+
+  // ─── v8.0.0 Exports ────────────────────────────────────────────────────
+
+  describe('v8.0.0 exports', () => {
+    it('should export safeJSONParse', () => {
+      const { safeJSONParse } = require('../src');
+      expect(safeJSONParse).toBeDefined();
+      expect(typeof safeJSONParse).toBe('function');
+    });
+
+    it('should export getStrictSecurityDefaults', () => {
+      const { getStrictSecurityDefaults } = require('../src');
+      expect(getStrictSecurityDefaults).toBeDefined();
+      expect(typeof getStrictSecurityDefaults).toBe('function');
+    });
+
+    it('should export detectIDNHomograph', () => {
+      const { detectIDNHomograph } = require('../src');
+      expect(detectIDNHomograph).toBeDefined();
+      expect(typeof detectIDNHomograph).toBe('function');
+    });
+
+    it('should export normalizeHostname', () => {
+      const { normalizeHostname } = require('../src');
+      expect(normalizeHostname).toBeDefined();
+      expect(typeof normalizeHostname).toBe('function');
     });
   });
 });

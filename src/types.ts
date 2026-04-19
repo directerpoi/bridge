@@ -175,6 +175,28 @@ export interface BridgeRequestConfig {
   /** Enable HTTP/2 for HTTPS requests. Pass true for defaults or an HTTP2Config object. */
   http2?: boolean | Partial<HTTP2Config>;
 
+  // ─── v8.0.0 Security Features ──────────────────────────────────────────────
+
+  /** Enable strict security mode — turns on all security features with the most secure defaults.
+   *  When enabled: enforces HTTPS, enables DNS protection, blocks private networks,
+   *  blocks IDN homograph attacks, enables safe JSON parsing, validates Content-Length,
+   *  limits response headers, and enforces TLS 1.3. */
+  strictSecurity?: boolean;
+  /** Block potential IDN homograph attacks in hostnames (default: false, true when strictSecurity is on) */
+  blockHomographAttacks?: boolean;
+  /** Maximum number of response headers allowed (default: 100). Prevents header flooding attacks. */
+  maxResponseHeaders?: number;
+  /** Maximum total size of response headers in bytes (default: 65536). Prevents header flooding. */
+  maxResponseHeaderSize?: number;
+  /** Maximum decompression ratio (compressed:decompressed) to prevent decompression bomb attacks (default: 100). */
+  maxDecompressionRatio?: number;
+  /** Enable safe JSON parsing that strips __proto__, constructor, and prototype properties
+   *  to prevent prototype pollution attacks (default: false, true when strictSecurity is on). */
+  safeJsonParsing?: boolean;
+  /** Validate that response body size matches Content-Length header to detect truncation/smuggling
+   *  (default: false, true when strictSecurity is on). */
+  validateContentLength?: boolean;
+
   // Retry options
   /** Enable automatic retry with exponential backoff. Pass true for defaults or a RetryConfig. */
   retry?: boolean | Partial<RetryConfig>;
