@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 import { URL } from 'url';
 import { BridgeRequestConfig, BridgeResponse, BridgeError, ProgressEvent } from './types';
 import { createError } from './error';
-import { validateURL, sanitizeHeaders, checkContentLength, dnsResolveAndValidate, injectRequestId, validateDomain, isSameOrigin, stripSensitiveHeaders, checkHttpsDowngrade } from './security';
+import { validateURL, sanitizeHeaders, checkContentLength, dnsResolveAndValidate, injectRequestId, validateDomain, isSameOrigin, stripSensitiveHeaders, checkHttpsDowngrade, safeJSONParse, checkDecompressionRatio, validateResponseHeaders, normalizeHostname, validateContentLengthIntegrity, getStrictSecurityDefaults, DEFAULT_MAX_RESPONSE_HEADERS, DEFAULT_MAX_RESPONSE_HEADER_SIZE, DEFAULT_MAX_DECOMPRESSION_RATIO } from './security';
 import { buildFullURL } from './utils';
 import { resolveRetryConfig, shouldRetry, calculateDelay, sleep } from './retry';
 import { createTimeline, finalizeTimeline, RequestTimeline } from './timeline';
@@ -108,22 +108,62 @@ function parseRetryAfter(value: string): number | null {
 
 function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
   return new Promise((resolve, reject) => {
+    // v8.0.0: Apply strict security defaults if enabled
+    let effectiveConfig = config;
+    if (config.strictSecurity) {
+      const strictDefaults = getStrictSecurityDefaults();
+      effectiveConfig = {
+        ...config,
+        enforceHttps: config.enforceHttps ?? strictDefaults.enforceHttps,
+        dnsProtection: config.dnsProtection ?? strictDefaults.dnsProtection,
+        stripSensitiveHeadersOnRedirect: config.stripSensitiveHeadersOnRedirect ?? strictDefaults.stripSensitiveHeadersOnRedirect,
+        allowHttpsDowngrade: config.allowHttpsDowngrade ?? strictDefaults.allowHttpsDowngrade,
+        allowPrivateNetworks: config.allowPrivateNetworks ?? strictDefaults.allowPrivateNetworks,
+        blockHomographAttacks: config.blockHomographAttacks ?? strictDefaults.blockHomographAttacks,
+        maxResponseHeaders: config.maxResponseHeaders ?? strictDefaults.maxResponseHeaders,
+        maxResponseHeaderSize: config.maxResponseHeaderSize ?? strictDefaults.maxResponseHeaderSize,
+        maxDecompressionRatio: config.maxDecompressionRatio ?? strictDefaults.maxDecompressionRatio,
+        safeJsonParsing: config.safeJsonParsing ?? strictDefaults.safeJsonParsing,
+        validateContentLength: config.validateContentLength ?? strictDefaults.validateContentLength,
+        tls: {
+          ...config.tls,
+          minVersion: config.tls?.minVersion ?? strictDefaults.tlsMinVersion,
+        },
+      };
+    }
+
     // Fire onRequest hook
-    if (config.hooks?.onRequest) {
-      config.hooks.onRequest(config);
+    if (effectiveConfig.hooks?.onRequest) {
+      effectiveConfig.hooks.onRequest(effectiveConfig);
     }
 
     // Initialize timeline if requested
-    const timeline: RequestTimeline | undefined = config.collectTimeline
+    const timeline: RequestTimeline | undefined = effectiveConfig.collectTimeline
       ? createTimeline()
       : undefined;
 
     // Inject request ID if enabled
-    const headersWithId = injectRequestId(config);
-    const configWithId = { ...config, headers: headersWithId };
+    const headersWithId = injectRequestId(effectiveConfig);
+    const configWithId = { ...effectiveConfig, headers: headersWithId };
 
     const fullURL = buildFullURL(configWithId);
     let parsedURL: URL;
+
+    // v8.0.0: IDN homograph attack protection — check the raw URL before URL parser normalizes it
+    if (configWithId.blockHomographAttacks) {
+      try {
+        // Extract hostname from the raw URL string before URL parser converts IDN to punycode
+        const rawHostnameMatch = fullURL.match(/^https?:\/\/([^/:?#]+)/i);
+        if (rawHostnameMatch) {
+          normalizeHostname(rawHostnameMatch[1], true);
+        }
+      } catch (err) {
+        const error = createError((err as Error).message, configWithId, 'ERR_IDN_HOMOGRAPH');
+        if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
+        reject(error);
+        return;
+      }
+    }
 
     try {
       parsedURL = validateURL(
@@ -133,7 +173,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
       );
     } catch (err) {
       const error = createError((err as Error).message, configWithId, 'ERR_INVALID_URL');
-      if (config.hooks?.onError) config.hooks.onError(error);
+      if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
       reject(error);
       return;
     }
@@ -147,7 +187,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
       );
     } catch (err) {
       const error = createError((err as Error).message, configWithId, 'ERR_DOMAIN_BLOCKED');
-      if (config.hooks?.onError) config.hooks.onError(error);
+      if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
       reject(error);
       return;
     }
@@ -158,7 +198,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
       headers = sanitizeHeaders(configWithId.headers);
     } catch (err) {
       const error = createError((err as Error).message, configWithId, 'ERR_HEADER_INJECTION');
-      if (config.hooks?.onError) config.hooks.onError(error);
+      if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
       reject(error);
       return;
     }
@@ -202,7 +242,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
           configWithId,
           'ERR_BODY_TOO_LARGE'
         );
-        if (config.hooks?.onError) config.hooks.onError(error);
+        if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
         reject(error);
         return;
       }
@@ -250,7 +290,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
     // Early abort check — before creating any request
     if (configWithId.signal && configWithId.signal.aborted) {
       const error = createError('Request aborted', configWithId, 'ERR_CANCELED');
-      if (config.hooks?.onError) config.hooks.onError(error);
+      if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
       reject(error);
       return;
     }
@@ -342,7 +382,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                       configWithId,
                       'ERR_CERT_FINGERPRINT_MISMATCH'
                     );
-                    if (config.hooks?.onError) config.hooks.onError(error);
+                    if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                     reject(error);
                     req.destroy();
                     return;
@@ -363,7 +403,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                   configWithId,
                   'ERR_MAX_REDIRECTS'
                 );
-                if (config.hooks?.onError) config.hooks.onError(error);
+                if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                 reject(error);
                 req.destroy();
                 return;
@@ -378,7 +418,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                   configWithId,
                   'ERR_INVALID_URL'
                 );
-                if (config.hooks?.onError) config.hooks.onError(error);
+                if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                 reject(error);
                 req.destroy();
                 return;
@@ -393,7 +433,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                 );
               } catch (err) {
                 const error = createError((err as Error).message, configWithId, 'ERR_INVALID_URL');
-                if (config.hooks?.onError) config.hooks.onError(error);
+                if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                 reject(error);
                 req.destroy();
                 return;
@@ -408,7 +448,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                 );
               } catch (err) {
                 const error = createError((err as Error).message, configWithId, 'ERR_DOMAIN_BLOCKED');
-                if (config.hooks?.onError) config.hooks.onError(error);
+                if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                 reject(error);
                 req.destroy();
                 return;
@@ -423,7 +463,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                 );
               } catch (err) {
                 const error = createError((err as Error).message, configWithId, 'ERR_HTTPS_DOWNGRADE');
-                if (config.hooks?.onError) config.hooks.onError(error);
+                if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                 reject(error);
                 req.destroy();
                 return;
@@ -490,7 +530,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
 
               const validateStatus = configWithId.validateStatus || defaultValidateStatus;
               if (validateStatus(statusCode)) {
-                if (config.hooks?.onResponse) config.hooks.onResponse(response);
+                if (effectiveConfig.hooks?.onResponse) effectiveConfig.hooks.onResponse(response);
                 resolve(response);
               } else {
                 const error = createError(
@@ -499,7 +539,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                   'ERR_BAD_RESPONSE',
                   response
                 );
-                if (config.hooks?.onError) config.hooks.onError(error);
+                if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                 reject(error);
               }
               return;
@@ -524,7 +564,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                   configWithId,
                   'ERR_RESPONSE_TIMEOUT'
                 );
-                if (config.hooks?.onError) config.hooks.onError(error);
+                if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                 reject(error);
               }, responseTimeout);
             }
@@ -540,7 +580,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                   configWithId,
                   'ERR_CONTENT_TOO_LARGE'
                 );
-                if (config.hooks?.onError) config.hooks.onError(error);
+                if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                 reject(error);
                 return;
               }
@@ -571,7 +611,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
               if (responseTimedOut) return;
               if (responseTimer) clearTimeout(responseTimer);
               const error = createError(err.message, configWithId, 'ERR_NETWORK');
-              if (config.hooks?.onError) config.hooks.onError(error);
+              if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
               reject(error);
             });
 
@@ -585,6 +625,41 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
               }
 
               const buffer = Buffer.concat(chunks);
+
+              // v8.0.0: Decompression bomb protection
+              if (encoding && configWithId.maxDecompressionRatio !== undefined) {
+                const compressedLength = parseInt(res.headers['content-length'] || '0', 10);
+                if (compressedLength > 0) {
+                  const maxRatio = configWithId.maxDecompressionRatio;
+                  if (!checkDecompressionRatio(compressedLength, buffer.length, maxRatio)) {
+                    const error = createError(
+                      `Decompression ratio ${Math.round(buffer.length / compressedLength)}:1 exceeds maximum allowed ${maxRatio}:1. ` +
+                      'This may indicate a decompression bomb attack.',
+                      configWithId,
+                      'ERR_DECOMPRESSION_BOMB'
+                    );
+                    if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
+                    reject(error);
+                    return;
+                  }
+                }
+              }
+
+              // v8.0.0: Content-Length integrity validation
+              if (configWithId.validateContentLength) {
+                const declaredLength = parseInt(res.headers['content-length'] || '-1', 10);
+                if (!validateContentLengthIntegrity(declaredLength, totalLength)) {
+                  const error = createError(
+                    `Content-Length mismatch: header declared ${declaredLength} bytes but received ${totalLength} bytes. ` +
+                    'This may indicate response truncation or smuggling.',
+                    configWithId,
+                    'ERR_CONTENT_LENGTH_MISMATCH'
+                  );
+                  if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
+                  reject(error);
+                  return;
+                }
+              }
 
               // v6.0.0: Response integrity verification (SHA-256)
               if (configWithId.expectedHash) {
@@ -600,7 +675,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                     configWithId,
                     'ERR_INTEGRITY_CHECK_FAILED'
                   );
-                  if (config.hooks?.onError) config.hooks.onError(error);
+                  if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                   reject(error);
                   return;
                 }
@@ -617,7 +692,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                     configWithId,
                     'ERR_CONTENT_TYPE_MISMATCH'
                   );
-                  if (config.hooks?.onError) config.hooks.onError(error);
+                  if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                   reject(error);
                   return;
                 }
@@ -630,6 +705,26 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                 }
               }
 
+              // v8.0.0: Response header flood protection
+              if (configWithId.maxResponseHeaders || configWithId.maxResponseHeaderSize) {
+                try {
+                  validateResponseHeaders(
+                    responseHeaders,
+                    configWithId.maxResponseHeaders ?? DEFAULT_MAX_RESPONSE_HEADERS,
+                    configWithId.maxResponseHeaderSize ?? DEFAULT_MAX_RESPONSE_HEADER_SIZE
+                  );
+                } catch (err) {
+                  const error = createError(
+                    (err as Error).message,
+                    configWithId,
+                    'ERR_RESPONSE_HEADER_FLOOD'
+                  );
+                  if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
+                  reject(error);
+                  return;
+                }
+              }
+
               let responseData: unknown;
               if (configWithId.responseType === 'arraybuffer') {
                 responseData = buffer;
@@ -639,8 +734,11 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                   responseData = text;
                 } else {
                   // Default: try JSON, fall back to text
+                  // v8.0.0: Use safe JSON parsing to prevent prototype pollution
                   try {
-                    responseData = JSON.parse(text);
+                    responseData = configWithId.safeJsonParsing
+                      ? safeJSONParse(text)
+                      : JSON.parse(text);
                   } catch {
                     responseData = text;
                   }
@@ -665,7 +763,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
 
               const validateStatus = configWithId.validateStatus || defaultValidateStatus;
               if (validateStatus(statusCode)) {
-                if (config.hooks?.onResponse) config.hooks.onResponse(response);
+                if (effectiveConfig.hooks?.onResponse) effectiveConfig.hooks.onResponse(response);
                 resolve(response);
               } else {
                 const error = createError(
@@ -674,7 +772,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                   'ERR_BAD_RESPONSE',
                   response
                 );
-                if (config.hooks?.onError) config.hooks.onError(error);
+                if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
                 reject(error);
               }
             });
@@ -700,7 +798,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
         // Error handler — must be registered before any destroy() calls
         req.on('error', (err: NodeJS.ErrnoException) => {
           const error = createError(err.message, configWithId, err.code || 'ERR_NETWORK');
-          if (config.hooks?.onError) config.hooks.onError(error);
+          if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
           reject(error);
         });
 
@@ -713,7 +811,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
               configWithId,
               'ECONNABORTED'
             );
-            if (config.hooks?.onError) config.hooks.onError(error);
+            if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
             reject(error);
           });
         }
@@ -727,7 +825,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
               configWithId,
               'ERR_CANCELED'
             );
-            if (config.hooks?.onError) config.hooks.onError(error);
+            if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
             reject(error);
           };
           if (configWithId.signal.aborted) {
@@ -808,7 +906,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
                 configWithId,
                 'ERR_PROXY_CONNECT_FAILED'
               );
-              if (config.hooks?.onError) config.hooks.onError(error);
+              if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
               reject(error);
             });
         } else {
@@ -837,7 +935,7 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
         })
         .catch((err) => {
           const error = createError((err as Error).message, configWithId, 'ERR_DNS_RESOLUTION');
-          if (config.hooks?.onError) config.hooks.onError(error);
+          if (effectiveConfig.hooks?.onError) effectiveConfig.hooks.onError(error);
           reject(error);
         });
     } else {

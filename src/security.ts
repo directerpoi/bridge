@@ -2,6 +2,7 @@ import * as url from 'url';
 import * as net from 'net';
 import * as dns from 'dns';
 import * as crypto from 'crypto';
+import * as punycode from 'punycode';
 import { BridgeRequestConfig } from './types';
 
 // ─── Private / Reserved IP Ranges ──────────────────────────────────────────────
@@ -372,5 +373,278 @@ export function checkHttpsDowngrade(
       'Set allowHttpsDowngrade: true to allow this.'
     );
   }
+}
+
+// ─── v8.0.0 Security Features ─────────────────────────────────────────────────
+
+// ─── Prototype Pollution Protection ────────────────────────────────────────────
+
+/**
+ * Dangerous property names that can be used for prototype pollution attacks.
+ * These are stripped from parsed JSON objects when safe JSON parsing is enabled.
+ */
+const DANGEROUS_PROPERTIES = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
+
+/**
+ * Recursively strips dangerous prototype pollution properties from a parsed object.
+ * Prevents attacks where malicious JSON payloads inject __proto__ or constructor.prototype
+ * to modify Object.prototype and compromise application security.
+ */
+function stripDangerousProperties(obj: unknown): unknown {
+  if (obj === null || typeof obj !== 'object') {
+    return obj;
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.map(stripDangerousProperties);
+  }
+
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    if (DANGEROUS_PROPERTIES.has(key)) {
+      continue; // Strip dangerous property
+    }
+    cleaned[key] = stripDangerousProperties(value);
+  }
+  return cleaned;
+}
+
+/**
+ * Safely parses JSON with prototype pollution protection.
+ * Strips __proto__, constructor, and prototype properties from the parsed result.
+ */
+export function safeJSONParse(text: string): unknown {
+  const parsed = JSON.parse(text);
+  return stripDangerousProperties(parsed);
+}
+
+// ─── Decompression Bomb Protection ─────────────────────────────────────────────
+
+/**
+ * Default maximum decompression ratio (compressed:decompressed).
+ * A ratio of 100:1 means decompressed data cannot exceed 100x the compressed size.
+ * This prevents decompression bomb (zip bomb) attacks where tiny compressed payloads
+ * expand to massive sizes consuming all available memory.
+ */
+export const DEFAULT_MAX_DECOMPRESSION_RATIO = 100;
+
+/**
+ * Validates the decompression ratio to detect potential decompression bomb attacks.
+ * Returns true if the ratio is within the allowed limit.
+ * @param compressedSize - Size of compressed data in bytes
+ * @param decompressedSize - Size of decompressed data in bytes
+ * @param maxRatio - Maximum allowed decompression ratio (default: 100)
+ */
+export function checkDecompressionRatio(
+  compressedSize: number,
+  decompressedSize: number,
+  maxRatio: number
+): boolean {
+  if (compressedSize <= 0) return true; // Can't compute ratio
+  const ratio = decompressedSize / compressedSize;
+  return ratio <= maxRatio;
+}
+
+// ─── Response Header Flood Protection ──────────────────────────────────────────
+
+/**
+ * Default maximum number of response headers allowed.
+ * Prevents header flooding attacks that exhaust memory with excessive headers.
+ */
+export const DEFAULT_MAX_RESPONSE_HEADERS = 100;
+
+/**
+ * Default maximum total size of all response headers (in bytes).
+ */
+export const DEFAULT_MAX_RESPONSE_HEADER_SIZE = 64 * 1024; // 64 KB
+
+/**
+ * Validates response headers against count and size limits.
+ * Throws if limits are exceeded.
+ * @param headers - Response headers object
+ * @param maxCount - Maximum number of headers allowed
+ * @param maxTotalSize - Maximum total size of all headers in bytes
+ */
+export function validateResponseHeaders(
+  headers: Record<string, string>,
+  maxCount: number,
+  maxTotalSize: number
+): void {
+  const entries = Object.entries(headers);
+
+  if (entries.length > maxCount) {
+    throw new Error(
+      `Response header count ${entries.length} exceeds maximum allowed ${maxCount}. ` +
+      'This may indicate a header flooding attack.'
+    );
+  }
+
+  let totalSize = 0;
+  for (const [key, value] of entries) {
+    totalSize += key.length + value.length + 4; // ": " + "\r\n"
+  }
+
+  if (totalSize > maxTotalSize) {
+    throw new Error(
+      `Response header total size ${totalSize} bytes exceeds maximum allowed ${maxTotalSize} bytes. ` +
+      'This may indicate a header flooding attack.'
+    );
+  }
+}
+
+// ─── IDN Homograph Attack Protection ───────────────────────────────────────────
+
+/**
+ * Latin look-alike characters commonly used in IDN homograph attacks.
+ * Maps Unicode confusable characters to their Latin equivalents.
+ */
+const CONFUSABLE_CHARS = new Map<string, string>([
+  ['\u0430', 'a'], // Cyrillic а
+  ['\u0435', 'e'], // Cyrillic е
+  ['\u043E', 'o'], // Cyrillic о
+  ['\u0440', 'p'], // Cyrillic р
+  ['\u0441', 'c'], // Cyrillic с
+  ['\u0443', 'y'], // Cyrillic у
+  ['\u0445', 'x'], // Cyrillic х
+  ['\u0455', 's'], // Cyrillic ѕ
+  ['\u0456', 'i'], // Cyrillic і
+  ['\u0458', 'j'], // Cyrillic ј
+  ['\u04BB', 'h'], // Cyrillic һ
+  ['\u0501', 'd'], // Cyrillic ԁ
+  ['\u051B', 'q'], // Cyrillic ԛ
+  ['\u051D', 'w'], // Cyrillic ԝ
+]);
+
+/**
+ * Checks if a hostname contains characters from multiple Unicode scripts,
+ * which is a common indicator of IDN homograph attacks.
+ * Returns true if the hostname is potentially confusable.
+ */
+export function detectIDNHomograph(hostname: string): boolean {
+  // Only check non-ASCII hostnames
+  if (/^[\x00-\x7F]+$/.test(hostname)) {
+    return false;
+  }
+
+  // Check if the hostname contains known confusable characters
+  for (const char of hostname) {
+    if (CONFUSABLE_CHARS.has(char)) {
+      return true;
+    }
+  }
+
+  // Check for mixed-script: detect if hostname contains both Latin and non-Latin characters
+  let hasLatin = false;
+  let hasNonLatinAlpha = false;
+
+  for (const char of hostname) {
+    const code = char.codePointAt(0)!;
+    if (char === '.' || char === '-') continue;
+
+    // Basic Latin letters
+    if ((code >= 0x41 && code <= 0x5A) || (code >= 0x61 && code <= 0x7A)) {
+      hasLatin = true;
+    } else if (code > 0x7F) {
+      // Non-ASCII character that isn't punctuation
+      hasNonLatinAlpha = true;
+    }
+  }
+
+  return hasLatin && hasNonLatinAlpha;
+}
+
+/**
+ * Normalizes a hostname to its ASCII/punycode representation.
+ * Detects and blocks potential IDN homograph attacks.
+ * @param hostname - The hostname to normalize
+ * @param blockHomographs - Whether to block detected homograph attacks (default: false)
+ */
+export function normalizeHostname(
+  hostname: string,
+  blockHomographs: boolean
+): string {
+  // Already ASCII
+  if (/^[\x00-\x7F]+$/.test(hostname)) {
+    return hostname.toLowerCase();
+  }
+
+  if (blockHomographs && detectIDNHomograph(hostname)) {
+    throw new Error(
+      `Potential IDN homograph attack detected in hostname "${hostname}". ` +
+      'The hostname contains characters from multiple scripts that may be visually confusable. ' +
+      'Set blockHomographAttacks: false to allow this.'
+    );
+  }
+
+  // Convert to punycode for safe comparison
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return punycode.toASCII(hostname).toLowerCase();
+  } catch {
+    return hostname.toLowerCase();
+  }
+}
+
+// ─── Content-Length Integrity ───────────────────────────────────────────────────
+
+/**
+ * Validates that the actual received body length matches the Content-Length header.
+ * Detects potential request smuggling or truncation attacks.
+ * @param declaredLength - The Content-Length header value
+ * @param actualLength - The actual size of the received body
+ */
+export function validateContentLengthIntegrity(
+  declaredLength: number,
+  actualLength: number
+): boolean {
+  // If no Content-Length header, skip validation
+  if (isNaN(declaredLength) || declaredLength < 0) return true;
+  return declaredLength === actualLength;
+}
+
+// ─── Strict Security Mode ──────────────────────────────────────────────────────
+
+/**
+ * Default strict security configuration.
+ * When strictSecurity is enabled, all security features are turned on with secure defaults.
+ */
+export interface StrictSecurityDefaults {
+  enforceHttps: boolean;
+  dnsProtection: boolean;
+  stripSensitiveHeadersOnRedirect: boolean;
+  allowHttpsDowngrade: boolean;
+  allowPrivateNetworks: boolean;
+  blockHomographAttacks: boolean;
+  maxResponseHeaders: number;
+  maxResponseHeaderSize: number;
+  maxDecompressionRatio: number;
+  safeJsonParsing: boolean;
+  validateContentLength: boolean;
+  tlsMinVersion: 'TLSv1.2' | 'TLSv1.3';
+}
+
+/**
+ * Returns the strict security defaults — the most secure configuration possible.
+ * Used when `strictSecurity: true` is set on the request config.
+ */
+export function getStrictSecurityDefaults(): StrictSecurityDefaults {
+  return {
+    enforceHttps: true,
+    dnsProtection: true,
+    stripSensitiveHeadersOnRedirect: true,
+    allowHttpsDowngrade: false,
+    allowPrivateNetworks: false,
+    blockHomographAttacks: true,
+    maxResponseHeaders: DEFAULT_MAX_RESPONSE_HEADERS,
+    maxResponseHeaderSize: DEFAULT_MAX_RESPONSE_HEADER_SIZE,
+    maxDecompressionRatio: DEFAULT_MAX_DECOMPRESSION_RATIO,
+    safeJsonParsing: true,
+    validateContentLength: true,
+    tlsMinVersion: 'TLSv1.3',
+  };
 }
 

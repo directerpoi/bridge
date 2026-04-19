@@ -7,6 +7,7 @@ import { ConcurrencyManager } from './concurrency';
 import { ResponseCache } from './cache';
 import { RequestDeduplicator } from './dedup';
 import { signRequest, verifySignature } from './signing';
+import { safeJSONParse, getStrictSecurityDefaults, detectIDNHomograph, normalizeHostname } from './security';
 import { DNSCache } from './dns-cache';
 import { CookieJar } from './cookie';
 import { MiddlewarePipeline } from './middleware';
@@ -38,13 +39,14 @@ import type { CookieJarConfig } from './cookie';
 import type { ProxyConfig } from './proxy';
 import type { HTTP2Config } from './http2';
 import type { MiddlewareFunction, MiddlewareContext } from './middleware';
+import type { StrictSecurityDefaults } from './security';
 
 // ─── Create Default Instance ───────────────────────────────────────────────────
 
 const bridge = createBridgeInstance({
   headers: {
     'Accept': 'application/json, text/plain, */*',
-    'User-Agent': 'bridge/7.0.0',
+    "User-Agent": 'bridge/8.0.0',
   },
   timeout: 0,
   responseType: 'json',
@@ -86,6 +88,7 @@ export { ConcurrencyManager };
 export { ResponseCache };
 export { RequestDeduplicator };
 export { signRequest, verifySignature };
+export { safeJSONParse, getStrictSecurityDefaults, detectIDNHomograph, normalizeHostname };
 export { DNSCache };
 export { CookieJar };
 export { MiddlewarePipeline };
@@ -119,6 +122,7 @@ export type {
   HTTP2Config,
   MiddlewareFunction,
   MiddlewareContext,
+  StrictSecurityDefaults,
 };
 
 // CommonJS compatibility
@@ -143,3 +147,7 @@ module.exports.DNSCache = DNSCache;
 module.exports.CookieJar = CookieJar;
 module.exports.MiddlewarePipeline = MiddlewarePipeline;
 module.exports.HTTP2SessionManager = HTTP2SessionManager;
+module.exports.safeJSONParse = safeJSONParse;
+module.exports.getStrictSecurityDefaults = getStrictSecurityDefaults;
+module.exports.detectIDNHomograph = detectIDNHomograph;
+module.exports.normalizeHostname = normalizeHostname;
