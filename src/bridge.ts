@@ -5,6 +5,8 @@ import { mergeConfig, buildFullURL } from './utils';
 import { RateLimiter, resolveRateLimitConfig } from './ratelimit';
 import { CircuitBreaker, resolveCircuitBreakerConfig, CircuitState } from './circuit-breaker';
 import { ConcurrencyManager, resolveConcurrencyConfig } from './concurrency';
+import { ResponseCache, resolveCacheConfig, CacheConfig } from './cache';
+import { RequestDeduplicator } from './dedup';
 import { createError } from './error';
 
 /**
@@ -22,6 +24,8 @@ export class Bridge {
   private rateLimiter: RateLimiter | null = null;
   private circuitBreaker: CircuitBreaker | null = null;
   private concurrencyManager: ConcurrencyManager | null = null;
+  private responseCache: ResponseCache | null = null;
+  private deduplicator: RequestDeduplicator | null = null;
 
   constructor(instanceConfig: BridgeRequestConfig = {}) {
     this.defaults = instanceConfig;
@@ -67,8 +71,40 @@ export class Bridge {
   }
 
   /**
+   * Set a response cache on this instance. Pass false to disable.
+   */
+  setCache(config: boolean | Partial<CacheConfig>): void {
+    if (config === false) {
+      this.responseCache = null;
+      return;
+    }
+    const resolved = resolveCacheConfig(config);
+    this.responseCache = resolved ? new ResponseCache(resolved) : null;
+  }
+
+  /**
+   * Clear the response cache.
+   */
+  clearCache(): void {
+    if (this.responseCache) {
+      this.responseCache.clear();
+    }
+  }
+
+  /**
+   * Enable or disable request deduplication.
+   */
+  setDeduplication(enabled: boolean): void {
+    if (enabled) {
+      this.deduplicator = this.deduplicator || new RequestDeduplicator();
+    } else {
+      this.deduplicator = null;
+    }
+  }
+
+  /**
    * The main request method. All convenience methods route here.
-   * Integrates rate limiting, circuit breaker, and concurrency control.
+   * Integrates rate limiting, circuit breaker, concurrency control, caching, and deduplication.
    */
   async request<T = unknown>(
     configOrUrl: string | BridgeRequestConfig,
@@ -80,6 +116,18 @@ export class Bridge {
       finalConfig = mergeConfig(this.defaults, config, { url: configOrUrl });
     } else {
       finalConfig = mergeConfig(this.defaults, configOrUrl);
+    }
+
+    const method = (finalConfig.method || 'GET').toUpperCase();
+    const fullURL = buildFullURL(finalConfig);
+
+    // v6.0.0: Check cache first
+    if (this.responseCache && this.responseCache.isCacheableMethod(method)) {
+      const cacheKey = ResponseCache.key(method, fullURL);
+      const cached = this.responseCache.get(cacheKey);
+      if (cached) {
+        return cached as BridgeResponse<T>;
+      }
     }
 
     // Circuit breaker check
@@ -178,14 +226,33 @@ export class Bridge {
         }
       }
 
+      // v6.0.0: Cache the response
+      if (this.responseCache && this.responseCache.isCacheableMethod(method)) {
+        const cacheKey = ResponseCache.key(method, fullURL);
+        this.responseCache.set(cacheKey, currentResponse);
+      }
+
       return currentResponse as BridgeResponse<T>;
     };
 
-    // Execute with or without concurrency control
-    if (this.concurrencyManager) {
-      return this.concurrencyManager.execute(executeInternal);
+    // v6.0.0: Wrap with deduplication if enabled
+    const executeWithConcurrency = (): Promise<BridgeResponse<T>> => {
+      if (this.concurrencyManager) {
+        return this.concurrencyManager.execute(executeInternal);
+      }
+      return executeInternal();
+    };
+
+    // v6.0.0: Deduplication — only for safe/idempotent methods
+    if (this.deduplicator && ['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+      const dedupKey = RequestDeduplicator.key(method, fullURL);
+      return this.deduplicator.execute(
+        dedupKey,
+        executeWithConcurrency
+      ) as Promise<BridgeResponse<T>>;
     }
-    return executeInternal();
+
+    return executeWithConcurrency();
   }
 
   /**

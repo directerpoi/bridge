@@ -1,4 +1,5 @@
 import * as http from 'http';
+import * as crypto from 'crypto';
 import bridge, {
   create,
   CancelToken,
@@ -6,6 +7,10 @@ import bridge, {
   isBridgeError,
   isAxiosError,
   BridgeRequestConfig,
+  ResponseCache,
+  RequestDeduplicator,
+  signRequest,
+  verifySignature,
 } from '../src';
 
 // ─── Test Types ────────────────────────────────────────────────────────────────
@@ -161,6 +166,57 @@ function createTestServer(): Promise<void> {
         if (pathname === '/redirect-with-headers') {
           res.writeHead(302, { Location: '/headers' });
           res.end();
+          return;
+        }
+
+        // Route: return a known body with specific content-type (for integrity/content-type tests)
+        if (pathname === '/known-body') {
+          const contentType = url.searchParams.get('type') || 'application/json';
+          const bodyContent = url.searchParams.get('body') || '{"known":"body"}';
+          res.writeHead(200, { 'Content-Type': contentType });
+          res.end(bodyContent);
+          return;
+        }
+
+        // Route: return retry-after header
+        if (pathname === '/retry-after') {
+          const retryAfter = url.searchParams.get('after') || '1';
+          const key = url.searchParams.get('key') || 'default-ra';
+          if (!flakyCounters[key]) flakyCounters[key] = 0;
+          flakyCounters[key]++;
+          if (flakyCounters[key] <= 1) {
+            res.writeHead(429, {
+              'Content-Type': 'application/json',
+              'Retry-After': retryAfter,
+            });
+            res.end(JSON.stringify({ error: 'Too Many Requests' }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true, attempts: flakyCounters[key] }));
+            flakyCounters[key] = 0;
+          }
+          return;
+        }
+
+        // Route: verify signed request
+        if (pathname === '/verify-signature') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            body: body || null,
+          }));
+          return;
+        }
+
+        // Route: return response with idempotency key echo
+        if (pathname === '/idempotency') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            idempotencyKey: req.headers['idempotency-key'] || null,
+            headers: req.headers,
+          }));
           return;
         }
 
@@ -1787,6 +1843,531 @@ describe('bridge', () => {
           expect(err.code).toBe('ERR_DOMAIN_BLOCKED');
         }
       }
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ─── v6.0.0 Features ─────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ─── Response Integrity Verification ──────────────────────────────────────
+
+  describe('response integrity verification', () => {
+    it('should pass when expectedHash matches response body SHA-256', async () => {
+      const body = '{"known":"body"}';
+      const expectedHash = crypto.createHash('sha256').update(body).digest('hex');
+
+      const res = await client.get(`${baseURL}/known-body?body=${encodeURIComponent(body)}`, {
+        expectedHash,
+        responseType: 'text',
+        allowPrivateNetworks: true,
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it('should reject when expectedHash does not match', async () => {
+      try {
+        await client.get(`${baseURL}/known-body`, {
+          expectedHash: 'deadbeef0000000000000000000000000000000000000000000000000000dead',
+          allowPrivateNetworks: true,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_INTEGRITY_CHECK_FAILED');
+          expect(err.message).toContain('integrity check failed');
+        }
+      }
+    });
+
+    it('should not check integrity when expectedHash is not set', async () => {
+      const res = await client.get(`${baseURL}/echo`, {
+        allowPrivateNetworks: true,
+      });
+      expect(res.status).toBe(200);
+    });
+  });
+
+  // ─── Content-Type Validation ──────────────────────────────────────────────
+
+  describe('content-type validation', () => {
+    it('should pass when Content-Type matches expected', async () => {
+      const res = await client.get(`${baseURL}/known-body?type=application/json`, {
+        expectedContentType: 'application/json',
+        allowPrivateNetworks: true,
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it('should pass with prefix match (e.g. application/json;charset=utf-8)', async () => {
+      const res = await client.get(`${baseURL}/known-body?type=application/json;charset=utf-8`, {
+        expectedContentType: 'application/json',
+        allowPrivateNetworks: true,
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it('should reject when Content-Type does not match', async () => {
+      try {
+        await client.get(`${baseURL}/text`, {
+          expectedContentType: 'application/json',
+          allowPrivateNetworks: true,
+        });
+        fail('Should have thrown');
+      } catch (err: unknown) {
+        expect(isBridgeError(err)).toBe(true);
+        if (isBridgeError(err)) {
+          expect(err.code).toBe('ERR_CONTENT_TYPE_MISMATCH');
+          expect(err.message).toContain('Content-Type mismatch');
+        }
+      }
+    });
+
+    it('should not validate Content-Type when not set', async () => {
+      const res = await client.get(`${baseURL}/text`, {
+        responseType: 'text',
+        allowPrivateNetworks: true,
+      });
+      expect(res.status).toBe(200);
+    });
+  });
+
+  // ─── Idempotency Key ─────────────────────────────────────────────────────
+
+  describe('idempotency key', () => {
+    it('should inject auto-generated Idempotency-Key when true', async () => {
+      const res = await client.post<{ idempotencyKey: string }>(`${baseURL}/idempotency`, {}, {
+        idempotencyKey: true,
+        allowPrivateNetworks: true,
+      });
+      expect(res.data.idempotencyKey).toBeDefined();
+      // UUID v4 format
+      expect(res.data.idempotencyKey).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      );
+    });
+
+    it('should inject custom Idempotency-Key when string is provided', async () => {
+      const customKey = 'my-custom-idempotency-key-123';
+      const res = await client.post<{ idempotencyKey: string }>(`${baseURL}/idempotency`, {}, {
+        idempotencyKey: customKey,
+        allowPrivateNetworks: true,
+      });
+      expect(res.data.idempotencyKey).toBe(customKey);
+    });
+
+    it('should not inject Idempotency-Key when not set', async () => {
+      const res = await client.post<{ idempotencyKey: string | null }>(`${baseURL}/idempotency`, {}, {
+        allowPrivateNetworks: true,
+      });
+      expect(res.data.idempotencyKey).toBeNull();
+    });
+  });
+
+  // ─── HMAC Request Signing ────────────────────────────────────────────────
+
+  describe('HMAC request signing', () => {
+    it('should add X-Signature header when requestSigning is configured', async () => {
+      const res = await client.post<{ headers: Record<string, string> }>(
+        `${baseURL}/verify-signature`,
+        { data: 'test' },
+        {
+          requestSigning: {
+            secret: 'test-secret-key',
+            algorithm: 'sha256',
+          },
+          allowPrivateNetworks: true,
+        }
+      );
+      expect(res.status).toBe(200);
+      expect(res.data.headers['x-signature']).toBeDefined();
+      expect(res.data.headers['x-signature-timestamp']).toBeDefined();
+    });
+
+    it('should support custom header name for signature', async () => {
+      const res = await client.get<{ headers: Record<string, string> }>(
+        `${baseURL}/verify-signature`,
+        {
+          requestSigning: {
+            secret: 'my-secret',
+            headerName: 'X-Custom-Sig',
+          },
+          allowPrivateNetworks: true,
+        }
+      );
+      expect(res.data.headers['x-custom-sig']).toBeDefined();
+    });
+
+    it('should include signed headers when specified', async () => {
+      const res = await client.get<{ headers: Record<string, string> }>(
+        `${baseURL}/verify-signature`,
+        {
+          headers: { 'X-Custom-Header': 'test-value' },
+          requestSigning: {
+            secret: 'my-secret',
+            signedHeaders: ['X-Custom-Header'],
+          },
+          allowPrivateNetworks: true,
+        }
+      );
+      expect(res.data.headers['x-signature']).toBeDefined();
+      expect(res.data.headers['x-signed-headers']).toBe('x-custom-header');
+    });
+
+    it('should not add signature when requestSigning is not set', async () => {
+      const res = await client.get<{ headers: Record<string, string> }>(
+        `${baseURL}/verify-signature`,
+        { allowPrivateNetworks: true }
+      );
+      expect(res.data.headers['x-signature']).toBeUndefined();
+    });
+  });
+
+  // ─── signRequest / verifySignature utility ───────────────────────────────
+
+  describe('signRequest / verifySignature', () => {
+    it('should generate and verify a valid signature', () => {
+      const sigConfig = {
+        secret: 'my-secret-key',
+        algorithm: 'sha256' as const,
+        signedHeaders: ['content-type'],
+        includeBody: true,
+        includeTimestamp: false,
+      };
+
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+      };
+      const body = '{"hello":"world"}';
+
+      const sigHeaders = signRequest(sigConfig, 'POST', 'https://example.com/api', headers, body);
+      expect(sigHeaders['X-Signature']).toBeDefined();
+
+      const allHeaders = { ...headers, ...sigHeaders };
+
+      const isValid = verifySignature(
+        sigConfig,
+        'POST',
+        'https://example.com/api',
+        allHeaders,
+        body,
+        sigHeaders['X-Signature']
+      );
+      expect(isValid).toBe(true);
+    });
+
+    it('should reject tampered body', () => {
+      const sigConfig = {
+        secret: 'my-secret-key',
+        algorithm: 'sha256' as const,
+        includeBody: true,
+        includeTimestamp: false,
+      };
+
+      const body = '{"hello":"world"}';
+      const sigHeaders = signRequest(sigConfig, 'POST', 'https://example.com/api', {}, body);
+
+      const isValid = verifySignature(
+        sigConfig,
+        'POST',
+        'https://example.com/api',
+        sigHeaders,
+        '{"hello":"tampered"}',
+        sigHeaders['X-Signature']
+      );
+      expect(isValid).toBe(false);
+    });
+
+    it('should reject invalid signature', () => {
+      const sigConfig = {
+        secret: 'my-secret-key',
+        algorithm: 'sha256' as const,
+        includeTimestamp: false,
+      };
+
+      const isValid = verifySignature(
+        sigConfig,
+        'GET',
+        'https://example.com/api',
+        {},
+        undefined,
+        'invalid-signature-hex'
+      );
+      expect(isValid).toBe(false);
+    });
+  });
+
+  // ─── Response Cache ───────────────────────────────────────────────────────
+
+  describe('response cache', () => {
+    it('should cache GET responses and return cached on subsequent calls', async () => {
+      const instance = client.create({ baseURL });
+      instance.setCache({ ttl: 5000, maxSize: 10 });
+
+      const res1 = await instance.get<EchoData>('/echo');
+      const res2 = await instance.get<EchoData>('/echo');
+
+      // Both should succeed
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      // Second should be the same object from cache
+      expect(res2).toBe(res1);
+    });
+
+    it('should not cache POST requests by default', async () => {
+      const instance = client.create({ baseURL });
+      instance.setCache({ ttl: 5000, maxSize: 10 });
+
+      const res1 = await instance.post<EchoData>('/echo', { data: 1 });
+      const res2 = await instance.post<EchoData>('/echo', { data: 2 });
+
+      // POST should not be cached
+      expect(res1).not.toBe(res2);
+    });
+
+    it('should expire cached responses after TTL', async () => {
+      const instance = client.create({ baseURL });
+      instance.setCache({ ttl: 50, maxSize: 10 }); // 50ms TTL
+
+      const res1 = await instance.get<EchoData>('/echo');
+      await new Promise((r) => setTimeout(r, 100)); // Wait for TTL to expire
+      const res2 = await instance.get<EchoData>('/echo');
+
+      // After TTL, should be a new response
+      expect(res2).not.toBe(res1);
+    });
+
+    it('should clear cache via clearCache()', async () => {
+      const instance = client.create({ baseURL });
+      instance.setCache({ ttl: 5000, maxSize: 10 });
+
+      const res1 = await instance.get<EchoData>('/echo');
+      instance.clearCache();
+      const res2 = await instance.get<EchoData>('/echo');
+
+      expect(res2).not.toBe(res1);
+    });
+
+    it('should disable cache with setCache(false)', async () => {
+      const instance = client.create({ baseURL });
+      instance.setCache(true); // Enable with defaults
+
+      const res1 = await instance.get<EchoData>('/echo');
+      instance.setCache(false); // Disable
+      const res2 = await instance.get<EchoData>('/echo');
+
+      expect(res2).not.toBe(res1);
+    });
+  });
+
+  // ─── ResponseCache class (unit) ──────────────────────────────────────────
+
+  describe('ResponseCache class', () => {
+    it('should store and retrieve entries', () => {
+      const cache = new ResponseCache({ ttl: 5000, maxSize: 10 });
+      const mockResponse = { data: 'test', status: 200, statusText: 'OK', headers: {}, config: {} } as any;
+
+      cache.set('GET:http://example.com', mockResponse);
+      expect(cache.get('GET:http://example.com')).toBe(mockResponse);
+    });
+
+    it('should return undefined for missing keys', () => {
+      const cache = new ResponseCache({ ttl: 5000, maxSize: 10 });
+      expect(cache.get('missing')).toBeUndefined();
+    });
+
+    it('should evict LRU entries when maxSize is reached', () => {
+      const cache = new ResponseCache({ ttl: 5000, maxSize: 2 });
+      const r1 = { data: '1', status: 200, statusText: 'OK', headers: {}, config: {} } as any;
+      const r2 = { data: '2', status: 200, statusText: 'OK', headers: {}, config: {} } as any;
+      const r3 = { data: '3', status: 200, statusText: 'OK', headers: {}, config: {} } as any;
+
+      cache.set('k1', r1);
+      cache.set('k2', r2);
+      cache.set('k3', r3); // Should evict k1
+
+      expect(cache.get('k1')).toBeUndefined();
+      expect(cache.get('k2')).toBe(r2);
+      expect(cache.get('k3')).toBe(r3);
+    });
+
+    it('should check existence with has()', () => {
+      const cache = new ResponseCache({ ttl: 5000, maxSize: 10 });
+      const mockResponse = { data: 'test', status: 200, statusText: 'OK', headers: {}, config: {} } as any;
+
+      cache.set('key', mockResponse);
+      expect(cache.has('key')).toBe(true);
+      expect(cache.has('missing')).toBe(false);
+    });
+
+    it('should clear all entries', () => {
+      const cache = new ResponseCache({ ttl: 5000, maxSize: 10 });
+      const mockResponse = { data: 'test', status: 200, statusText: 'OK', headers: {}, config: {} } as any;
+
+      cache.set('k1', mockResponse);
+      cache.set('k2', mockResponse);
+      cache.clear();
+
+      expect(cache.size).toBe(0);
+    });
+
+    it('should identify cacheable methods', () => {
+      const cache = new ResponseCache({ ttl: 5000, maxSize: 10 });
+      expect(cache.isCacheableMethod('GET')).toBe(true);
+      expect(cache.isCacheableMethod('HEAD')).toBe(true);
+      expect(cache.isCacheableMethod('POST')).toBe(false);
+      expect(cache.isCacheableMethod('PUT')).toBe(false);
+    });
+
+    it('should generate correct cache keys', () => {
+      expect(ResponseCache.key('get', 'http://example.com')).toBe('GET:http://example.com');
+      expect(ResponseCache.key('POST', '/api')).toBe('POST:/api');
+    });
+  });
+
+  // ─── Request Deduplication ────────────────────────────────────────────────
+
+  describe('request deduplication', () => {
+    it('should deduplicate concurrent identical GET requests', async () => {
+      const instance = client.create({ baseURL });
+      instance.setDeduplication(true);
+
+      // Launch two identical GET requests simultaneously
+      const [res1, res2] = await Promise.all([
+        instance.get<EchoData>('/echo'),
+        instance.get<EchoData>('/echo'),
+      ]);
+
+      // Both should succeed
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      // They should be the same promise result (same object)
+      expect(res1).toBe(res2);
+    });
+
+    it('should not deduplicate POST requests', async () => {
+      const instance = client.create({ baseURL });
+      instance.setDeduplication(true);
+
+      const [res1, res2] = await Promise.all([
+        instance.post<EchoData>('/echo', { a: 1 }),
+        instance.post<EchoData>('/echo', { a: 2 }),
+      ]);
+
+      // POST should not be deduplicated
+      expect(res1).not.toBe(res2);
+    });
+
+    it('should not deduplicate different URLs', async () => {
+      const instance = client.create({ baseURL });
+      instance.setDeduplication(true);
+
+      const [res1, res2] = await Promise.all([
+        instance.get('/echo'),
+        instance.get('/text'),
+      ]);
+
+      expect(res1).not.toBe(res2);
+    });
+
+    it('should allow disabling deduplication', async () => {
+      const instance = client.create({ baseURL });
+      instance.setDeduplication(true);
+      instance.setDeduplication(false);
+
+      const [res1, res2] = await Promise.all([
+        instance.get<EchoData>('/echo'),
+        instance.get<EchoData>('/echo'),
+      ]);
+
+      // Without dedup, they should be different response objects
+      expect(res1).not.toBe(res2);
+    });
+  });
+
+  // ─── RequestDeduplicator class (unit) ────────────────────────────────────
+
+  describe('RequestDeduplicator class', () => {
+    it('should generate correct keys', () => {
+      expect(RequestDeduplicator.key('get', '/api')).toBe('GET:/api');
+      expect(RequestDeduplicator.key('POST', '/data')).toBe('POST:/data');
+    });
+
+    it('should track inflight requests', async () => {
+      const dedup = new RequestDeduplicator();
+      expect(dedup.getInflightCount()).toBe(0);
+
+      let resolveFactory!: (value: any) => void;
+      const factory = () => new Promise<any>((resolve) => { resolveFactory = resolve; });
+
+      const promise = dedup.execute('key', factory);
+      expect(dedup.getInflightCount()).toBe(1);
+      expect(dedup.isInflight('key')).toBe(true);
+
+      resolveFactory({ data: 'done', status: 200, statusText: 'OK', headers: {}, config: {} });
+      await promise;
+
+      expect(dedup.getInflightCount()).toBe(0);
+      expect(dedup.isInflight('key')).toBe(false);
+    });
+  });
+
+  // ─── Retry-After Header Support ──────────────────────────────────────────
+
+  describe('Retry-After header support', () => {
+    it('should respect Retry-After header during retry', async () => {
+      const key = `retry-after-test-${Date.now()}`;
+      const start = Date.now();
+      const res = await client.get(`${baseURL}/retry-after?after=1&key=${key}`, {
+        retry: { retries: 2, delay: 50, maxDelay: 5000, backoffFactor: 1, retryableMethods: ['GET'], retryableStatuses: [429] },
+        respectRetryAfter: true,
+        allowPrivateNetworks: true,
+      });
+      const elapsed = Date.now() - start;
+
+      expect(res.status).toBe(200);
+      // Should have waited at least ~1 second due to Retry-After: 1
+      expect(elapsed).toBeGreaterThanOrEqual(800);
+    });
+
+    it('should cap Retry-After at maxDelay', async () => {
+      const key = `retry-after-cap-${Date.now()}`;
+      const start = Date.now();
+      const res = await client.get(`${baseURL}/retry-after?after=10&key=${key}`, {
+        retry: { retries: 2, delay: 50, maxDelay: 200, backoffFactor: 1, retryableMethods: ['GET'], retryableStatuses: [429] },
+        respectRetryAfter: true,
+        allowPrivateNetworks: true,
+      });
+      const elapsed = Date.now() - start;
+
+      expect(res.status).toBe(200);
+      // Should be capped at maxDelay (200ms), not 10 seconds
+      expect(elapsed).toBeLessThan(2000);
+    });
+
+    it('should disable Retry-After respect with respectRetryAfter: false', async () => {
+      const key = `retry-after-disabled-${Date.now()}`;
+      const start = Date.now();
+      const res = await client.get(`${baseURL}/retry-after?after=5&key=${key}`, {
+        retry: { retries: 2, delay: 50, maxDelay: 200, backoffFactor: 1, retryableMethods: ['GET'], retryableStatuses: [429] },
+        respectRetryAfter: false,
+        allowPrivateNetworks: true,
+      });
+      const elapsed = Date.now() - start;
+
+      expect(res.status).toBe(200);
+      // Without Retry-After respect, should complete faster
+      expect(elapsed).toBeLessThan(2000);
+    });
+  });
+
+  // ─── v6.0.0 Version Check ────────────────────────────────────────────────
+
+  describe('v6.0.0 version', () => {
+    it('should send bridge/6.0.0 User-Agent header', async () => {
+      const res = await client.get<EchoData>(`${baseURL}/echo`);
+      expect(res.data.headers['user-agent']).toBe('bridge/6.0.0');
     });
   });
 });

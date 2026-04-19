@@ -4,6 +4,9 @@ import { isBridgeError } from './error';
 import { RateLimiter } from './ratelimit';
 import { CircuitBreaker } from './circuit-breaker';
 import { ConcurrencyManager } from './concurrency';
+import { ResponseCache } from './cache';
+import { RequestDeduplicator } from './dedup';
+import { signRequest, verifySignature } from './signing';
 import {
   BridgeRequestConfig,
   BridgeResponse,
@@ -24,13 +27,15 @@ import {
 } from './types';
 import type { RequestTimeline } from './timeline';
 import type { CircuitState } from './circuit-breaker';
+import type { CacheConfig } from './cache';
+import type { RequestSigningConfig } from './signing';
 
 // ─── Create Default Instance ───────────────────────────────────────────────────
 
 const bridge = createBridgeInstance({
   headers: {
     'Accept': 'application/json, text/plain, */*',
-    'User-Agent': 'bridge/5.0.0',
+    'User-Agent': 'bridge/6.0.0',
   },
   timeout: 0,
   responseType: 'json',
@@ -69,6 +74,9 @@ export { isBridgeError, isBridgeError as isAxiosError };
 export { RateLimiter };
 export { CircuitBreaker };
 export { ConcurrencyManager };
+export { ResponseCache };
+export { RequestDeduplicator };
+export { signRequest, verifySignature };
 
 // Re-export types
 export type {
@@ -90,13 +98,17 @@ export type {
   EventHooks,
   RequestTimeline,
   CircuitState,
+  CacheConfig,
+  RequestSigningConfig,
 };
 
 // CommonJS compatibility
+// Note: module.exports = bridge means module.exports IS bridge,
+// so we must not override bridge's instance methods (like create).
 module.exports = bridge;
 module.exports.default = bridge;
 module.exports.bridge = bridge;
-module.exports.create = createBridgeInstance;
+module.exports.createBridgeInstance = createBridgeInstance;
 module.exports.CancelToken = CancelToken;
 module.exports.isCancel = isCancel;
 module.exports.isBridgeError = isBridgeError;
@@ -104,3 +116,7 @@ module.exports.isAxiosError = isBridgeError;
 module.exports.RateLimiter = RateLimiter;
 module.exports.CircuitBreaker = CircuitBreaker;
 module.exports.ConcurrencyManager = ConcurrencyManager;
+module.exports.ResponseCache = ResponseCache;
+module.exports.RequestDeduplicator = RequestDeduplicator;
+module.exports.signRequest = signRequest;
+module.exports.verifySignature = verifySignature;

@@ -2,6 +2,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as tls from 'tls';
 import * as zlib from 'zlib';
+import * as crypto from 'crypto';
 import { URL } from 'url';
 import { BridgeRequestConfig, BridgeResponse, BridgeError, ProgressEvent } from './types';
 import { createError } from './error';
@@ -9,6 +10,7 @@ import { validateURL, sanitizeHeaders, checkContentLength, dnsResolveAndValidate
 import { buildFullURL } from './utils';
 import { resolveRetryConfig, shouldRetry, calculateDelay, sleep } from './retry';
 import { createTimeline, finalizeTimeline, RequestTimeline } from './timeline';
+import { signRequest } from './signing';
 
 // ─── Default Config ────────────────────────────────────────────────────────────
 
@@ -34,6 +36,7 @@ async function executeWithRetry(
   retryConfig: ReturnType<typeof resolveRetryConfig> & object
 ): Promise<BridgeResponse> {
   let lastError: BridgeError | undefined;
+  const respectRetryAfter = config.respectRetryAfter !== false;
 
   for (let attempt = 0; attempt <= retryConfig.retries; attempt++) {
     try {
@@ -52,7 +55,21 @@ async function executeWithRetry(
         throw bridgeError;
       }
 
-      const delay = calculateDelay(retryConfig, attempt);
+      let delay = calculateDelay(retryConfig, attempt);
+
+      // v6.0.0: Respect Retry-After header from server
+      if (respectRetryAfter && bridgeError.response?.headers) {
+        const retryAfter = bridgeError.response.headers['retry-after'];
+        if (retryAfter) {
+          const retryAfterMs = parseRetryAfter(retryAfter);
+          if (retryAfterMs !== null && retryAfterMs > 0) {
+            // Use the larger of calculated delay and Retry-After
+            delay = Math.max(delay, retryAfterMs);
+            // Cap at maxDelay to prevent absurdly long waits
+            delay = Math.min(delay, retryConfig.maxDelay);
+          }
+        }
+      }
 
       // Fire onRetry hook
       if (config.hooks?.onRetry) {
@@ -64,6 +81,27 @@ async function executeWithRetry(
   }
 
   throw lastError;
+}
+
+/**
+ * Parses a Retry-After header value into milliseconds.
+ * Supports both delay-seconds and HTTP-date formats.
+ */
+function parseRetryAfter(value: string): number | null {
+  // Try as number (seconds)
+  const seconds = parseInt(value, 10);
+  if (!isNaN(seconds) && String(seconds) === value.trim()) {
+    return seconds * 1000;
+  }
+
+  // Try as HTTP-date
+  const date = new Date(value);
+  if (!isNaN(date.getTime())) {
+    const delayMs = date.getTime() - Date.now();
+    return delayMs > 0 ? delayMs : 0;
+  }
+
+  return null;
 }
 
 function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
@@ -177,6 +215,28 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
     // Accept-Encoding for automatic decompression
     if (decompress && !headers['Accept-Encoding'] && !headers['accept-encoding']) {
       headers['Accept-Encoding'] = 'gzip, deflate, br';
+    }
+
+    // v6.0.0: Idempotency key injection
+    if (configWithId.idempotencyKey) {
+      const idempotencyValue = typeof configWithId.idempotencyKey === 'string'
+        ? configWithId.idempotencyKey
+        : crypto.randomUUID();
+      headers['Idempotency-Key'] = idempotencyValue;
+    }
+
+    // v6.0.0: HMAC request signing
+    if (configWithId.requestSigning) {
+      const signingHeaders = signRequest(
+        configWithId.requestSigning,
+        method,
+        fullURL,
+        headers,
+        requestData
+      );
+      for (const [key, value] of Object.entries(signingHeaders)) {
+        headers[key] = value;
+      }
     }
 
     // Basic auth
@@ -518,6 +578,44 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
               }
 
               const buffer = Buffer.concat(chunks);
+
+              // v6.0.0: Response integrity verification (SHA-256)
+              if (configWithId.expectedHash) {
+                const actualHash = crypto
+                  .createHash('sha256')
+                  .update(buffer)
+                  .digest('hex');
+                const normalizedExpected = configWithId.expectedHash.toLowerCase().replace(/:/g, '');
+                const normalizedActual = actualHash.toLowerCase();
+                if (normalizedExpected !== normalizedActual) {
+                  const error = createError(
+                    `Response integrity check failed. Expected hash: ${configWithId.expectedHash}, Got: ${actualHash}`,
+                    configWithId,
+                    'ERR_INTEGRITY_CHECK_FAILED'
+                  );
+                  if (config.hooks?.onError) config.hooks.onError(error);
+                  reject(error);
+                  return;
+                }
+              }
+
+              // v6.0.0: Content-Type validation
+              if (configWithId.expectedContentType) {
+                const actualContentType = res.headers['content-type'] || '';
+                const expected = configWithId.expectedContentType.toLowerCase();
+                const actual = actualContentType.toLowerCase();
+                if (!actual.startsWith(expected)) {
+                  const error = createError(
+                    `Response Content-Type mismatch. Expected: ${configWithId.expectedContentType}, Got: ${actualContentType}`,
+                    configWithId,
+                    'ERR_CONTENT_TYPE_MISMATCH'
+                  );
+                  if (config.hooks?.onError) config.hooks.onError(error);
+                  reject(error);
+                  return;
+                }
+              }
+
               const responseHeaders: Record<string, string> = {};
               for (const [key, value] of Object.entries(res.headers)) {
                 if (value !== undefined) {
