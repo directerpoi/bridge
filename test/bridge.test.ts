@@ -220,6 +220,16 @@ function createTestServer(): Promise<void> {
           return;
         }
 
+        // Route: set a cookie (for cookie jar testing)
+        if (pathname === '/set-cookie') {
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Set-Cookie': 'test_cookie=hello; Path=/',
+          });
+          res.end(JSON.stringify({ cookieSet: true }));
+          return;
+        }
+
         // Default 404
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Not found' }));
@@ -2362,12 +2372,556 @@ describe('bridge', () => {
     });
   });
 
-  // ─── v6.0.0 Version Check ────────────────────────────────────────────────
+  // ─── v7.0.0 Version Check ────────────────────────────────────────────────
 
-  describe('v6.0.0 version', () => {
-    it('should send bridge/6.0.0 User-Agent header', async () => {
+  describe('v7.0.0 version', () => {
+    it('should send bridge/7.0.0 User-Agent header', async () => {
       const res = await client.get<EchoData>(`${baseURL}/echo`);
-      expect(res.data.headers['user-agent']).toBe('bridge/6.0.0');
+      expect(res.data.headers['user-agent']).toBe('bridge/7.0.0');
+    });
+  });
+
+  // ─── v7.0.0 CookieJar ───────────────────────────────────────────────────
+
+  describe('CookieJar', () => {
+    it('should store and retrieve cookies', () => {
+      const { CookieJar } = require('../src/cookie');
+      const jar = new CookieJar();
+      jar.setCookies(['session=abc123; Path=/; HttpOnly'], 'example.com', '/');
+      const header = jar.getCookieHeader('example.com', '/api', false);
+      expect(header).toBe('session=abc123');
+    });
+
+    it('should respect domain scoping', () => {
+      const { CookieJar } = require('../src/cookie');
+      const jar = new CookieJar();
+      jar.setCookies(['token=xyz; Domain=example.com; Path=/'], 'sub.example.com', '/');
+      expect(jar.getCookieHeader('example.com', '/', false)).toBe('token=xyz');
+      expect(jar.getCookieHeader('other.com', '/', false)).toBe('');
+    });
+
+    it('should respect path scoping', () => {
+      const { CookieJar } = require('../src/cookie');
+      const jar = new CookieJar();
+      jar.setCookies(['api_key=123; Path=/api'], 'example.com', '/api/v1');
+      expect(jar.getCookieHeader('example.com', '/api/v1', false)).toBe('api_key=123');
+      expect(jar.getCookieHeader('example.com', '/other', false)).toBe('');
+    });
+
+    it('should respect Secure flag', () => {
+      const { CookieJar } = require('../src/cookie');
+      const jar = new CookieJar();
+      jar.setCookies(['secure_token=abc; Secure; Path=/'], 'example.com', '/');
+      expect(jar.getCookieHeader('example.com', '/', false)).toBe('');
+      expect(jar.getCookieHeader('example.com', '/', true)).toBe('secure_token=abc');
+    });
+
+    it('should expire cookies based on Max-Age', async () => {
+      const { CookieJar } = require('../src/cookie');
+      const jar = new CookieJar();
+      jar.setCookies(['temp=val; Max-Age=0; Path=/'], 'example.com', '/');
+      // Max-Age=0 means immediately expired
+      await new Promise((r) => setTimeout(r, 10));
+      expect(jar.getCookieHeader('example.com', '/', false)).toBe('');
+    });
+
+    it('should clear all cookies', () => {
+      const { CookieJar } = require('../src/cookie');
+      const jar = new CookieJar();
+      jar.setCookies(['a=1; Path=/'], 'example.com', '/');
+      jar.setCookies(['b=2; Path=/'], 'other.com', '/');
+      expect(jar.size).toBe(2);
+      jar.clear();
+      expect(jar.size).toBe(0);
+    });
+
+    it('should clear cookies for a specific domain', () => {
+      const { CookieJar } = require('../src/cookie');
+      const jar = new CookieJar();
+      jar.setCookies(['a=1; Path=/'], 'example.com', '/');
+      jar.setCookies(['b=2; Path=/'], 'other.com', '/');
+      jar.clearDomain('example.com');
+      expect(jar.size).toBe(1);
+      expect(jar.getCookieHeader('other.com', '/', false)).toBe('b=2');
+    });
+
+    it('should handle multiple Set-Cookie headers', () => {
+      const { CookieJar } = require('../src/cookie');
+      const jar = new CookieJar();
+      jar.setCookies([
+        'a=1; Path=/',
+        'b=2; Path=/',
+        'c=3; Path=/api',
+      ], 'example.com', '/');
+      const header = jar.getCookieHeader('example.com', '/', false);
+      expect(header).toContain('a=1');
+      expect(header).toContain('b=2');
+      // c=3 has path /api so should not match /
+      expect(header).not.toContain('c=3');
+    });
+
+    it('should replace cookies with same name/domain/path', () => {
+      const { CookieJar } = require('../src/cookie');
+      const jar = new CookieJar();
+      jar.setCookies(['token=old; Path=/'], 'example.com', '/');
+      jar.setCookies(['token=new; Path=/'], 'example.com', '/');
+      expect(jar.getCookieHeader('example.com', '/', false)).toBe('token=new');
+      expect(jar.size).toBe(1);
+    });
+
+    it('should match subdomains', () => {
+      const { CookieJar } = require('../src/cookie');
+      const jar = new CookieJar();
+      jar.setCookies(['token=val; Domain=example.com; Path=/'], 'example.com', '/');
+      expect(jar.getCookieHeader('sub.example.com', '/', false)).toBe('token=val');
+      expect(jar.getCookieHeader('deep.sub.example.com', '/', false)).toBe('token=val');
+    });
+  });
+
+  // ─── v7.0.0 CookieJar Integration ────────────────────────────────────────
+
+  describe('cookie jar integration', () => {
+    it('should inject cookies from jar into requests', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+      instance.setCookieJar(true);
+      // Manually trigger a request to the set-cookie endpoint, then check the cookie is sent
+      const res1 = await instance.get<EchoData>(`${baseURL}/set-cookie`);
+      // Now make another request — the cookie should be sent
+      const res2 = await instance.get<EchoData>(`${baseURL}/echo`);
+      expect(res2.data.headers['cookie']).toBeDefined();
+      expect(res2.data.headers['cookie']).toContain('test_cookie=hello');
+    });
+
+    it('should clear cookies via clearCookies()', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+      instance.setCookieJar(true);
+      await instance.get(`${baseURL}/set-cookie`);
+      instance.clearCookies();
+      const res = await instance.get<EchoData>(`${baseURL}/echo`);
+      expect(res.data.headers['cookie']).toBeUndefined();
+    });
+
+    it('should disable cookie jar with setCookieJar(false)', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+      instance.setCookieJar(true);
+      await instance.get(`${baseURL}/set-cookie`);
+      instance.setCookieJar(false);
+      const res = await instance.get<EchoData>(`${baseURL}/echo`);
+      expect(res.data.headers['cookie']).toBeUndefined();
+    });
+  });
+
+  // ─── v7.0.0 DNSCache ────────────────────────────────────────────────────
+
+  describe('DNSCache class', () => {
+    it('should resolve and cache hostnames', async () => {
+      const { DNSCache } = require('../src/dns-cache');
+      const cache = new DNSCache({ ttl: 5000 });
+      // localhost should resolve
+      const addrs = await cache.lookup('localhost');
+      expect(addrs.length).toBeGreaterThan(0);
+      expect(cache.has('localhost')).toBe(true);
+      // Second lookup should hit cache
+      const addrs2 = await cache.lookup('localhost');
+      expect(addrs2).toEqual(addrs);
+    });
+
+    it('should handle IP addresses directly', async () => {
+      const { DNSCache } = require('../src/dns-cache');
+      const cache = new DNSCache();
+      const addrs = await cache.lookup('127.0.0.1');
+      expect(addrs).toEqual([{ address: '127.0.0.1', family: 4 }]);
+    });
+
+    it('should clear cache', async () => {
+      const { DNSCache } = require('../src/dns-cache');
+      const cache = new DNSCache();
+      await cache.lookup('localhost');
+      expect(cache.has('localhost')).toBe(true);
+      cache.clear();
+      expect(cache.has('localhost')).toBe(false);
+    });
+
+    it('should invalidate a specific hostname', async () => {
+      const { DNSCache } = require('../src/dns-cache');
+      const cache = new DNSCache();
+      await cache.lookup('localhost');
+      cache.invalidate('localhost');
+      expect(cache.has('localhost')).toBe(false);
+    });
+
+    it('should evict LRU entries when maxSize is reached', async () => {
+      const { DNSCache } = require('../src/dns-cache');
+      const cache = new DNSCache({ maxSize: 1, ttl: 60000 });
+      // Use actual hostnames that require DNS resolution
+      await cache.lookup('localhost');
+      expect(cache.has('localhost')).toBe(true);
+      // Lookup another hostname — should evict 'localhost' since maxSize is 1
+      // Use the loopback address name which also resolves
+      await cache.lookup('ip6-localhost').catch(() => {
+        // ip6-localhost may not resolve on all systems, that's OK
+      });
+      // Regardless, maxSize should be respected
+      expect(cache.size).toBeLessThanOrEqual(1);
+    });
+  });
+
+  // ─── v7.0.0 DNS Cache Integration ────────────────────────────────────────
+
+  describe('dns cache integration', () => {
+    it('should enable DNS caching on instance', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+      instance.setDNSCache(true);
+      // Make two requests — both should succeed
+      const res1 = await instance.get<EchoData>(`${baseURL}/echo`);
+      const res2 = await instance.get<EchoData>(`${baseURL}/echo`);
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+    });
+
+    it('should clear DNS cache', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+      instance.setDNSCache(true);
+      await instance.get(`${baseURL}/echo`);
+      instance.clearDNSCache();
+      const res = await instance.get<EchoData>(`${baseURL}/echo`);
+      expect(res.status).toBe(200);
+    });
+
+    it('should disable DNS cache with setDNSCache(false)', () => {
+      const instance = bridge.create({
+        allowPrivateNetworks: true,
+      });
+      instance.setDNSCache(true);
+      instance.setDNSCache(false);
+      // No error — just verifying it doesn't throw
+    });
+  });
+
+  // ─── v7.0.0 Middleware Pipeline ──────────────────────────────────────────
+
+  describe('MiddlewarePipeline class', () => {
+    it('should execute middleware in order', async () => {
+      const { MiddlewarePipeline } = require('../src/middleware');
+      const pipeline = new MiddlewarePipeline();
+      const order: number[] = [];
+
+      pipeline.use('first', async (_ctx: any, next: () => Promise<void>) => {
+        order.push(1);
+        await next();
+        order.push(4);
+      });
+
+      pipeline.use('second', async (_ctx: any, next: () => Promise<void>) => {
+        order.push(2);
+        await next();
+        order.push(3);
+      });
+
+      const ctx = { config: {}, metadata: {} };
+      await pipeline.execute(ctx, async () => {
+        order.push(99);
+      });
+
+      expect(order).toEqual([1, 2, 99, 3, 4]);
+    });
+
+    it('should allow middleware to modify config', async () => {
+      const { MiddlewarePipeline } = require('../src/middleware');
+      const pipeline = new MiddlewarePipeline();
+
+      pipeline.use('add-header', async (ctx: any, next: () => Promise<void>) => {
+        ctx.config.headers = { ...ctx.config.headers, 'X-Custom': 'test' };
+        await next();
+      });
+
+      const ctx = { config: { headers: {} }, metadata: {} };
+      await pipeline.execute(ctx, async () => {});
+      expect(ctx.config.headers['X-Custom']).toBe('test');
+    });
+
+    it('should support removing middleware by name', () => {
+      const { MiddlewarePipeline } = require('../src/middleware');
+      const pipeline = new MiddlewarePipeline();
+      pipeline.use('removable', async (_ctx: any, next: () => Promise<void>) => { await next(); });
+      expect(pipeline.length).toBe(1);
+      expect(pipeline.remove('removable')).toBe(true);
+      expect(pipeline.length).toBe(0);
+    });
+
+    it('should return false when removing non-existent middleware', () => {
+      const { MiddlewarePipeline } = require('../src/middleware');
+      const pipeline = new MiddlewarePipeline();
+      expect(pipeline.remove('nonexistent')).toBe(false);
+    });
+
+    it('should list middleware names', () => {
+      const { MiddlewarePipeline } = require('../src/middleware');
+      const pipeline = new MiddlewarePipeline();
+      pipeline.use('auth', async (_ctx: any, next: () => Promise<void>) => { await next(); });
+      pipeline.use('logging', async (_ctx: any, next: () => Promise<void>) => { await next(); });
+      expect(pipeline.getNames()).toEqual(['auth', 'logging']);
+    });
+
+    it('should clear all middleware', () => {
+      const { MiddlewarePipeline } = require('../src/middleware');
+      const pipeline = new MiddlewarePipeline();
+      pipeline.use(async (_ctx: any, next: () => Promise<void>) => { await next(); });
+      pipeline.use(async (_ctx: any, next: () => Promise<void>) => { await next(); });
+      pipeline.clear();
+      expect(pipeline.length).toBe(0);
+    });
+
+    it('should throw if next() is called multiple times', async () => {
+      const { MiddlewarePipeline } = require('../src/middleware');
+      const pipeline = new MiddlewarePipeline();
+
+      pipeline.use(async (_ctx: any, next: () => Promise<void>) => {
+        await next();
+        await next(); // Should throw
+      });
+
+      const ctx = { config: {}, metadata: {} };
+      await expect(pipeline.execute(ctx, async () => {})).rejects.toThrow('next() called multiple times');
+    });
+  });
+
+  // ─── v7.0.0 Middleware Integration ───────────────────────────────────────
+
+  describe('middleware integration', () => {
+    it('should execute middleware during requests', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+
+      let middlewareCalled = false;
+      instance.useMiddleware('test', async (ctx, next) => {
+        middlewareCalled = true;
+        await next();
+      });
+
+      await instance.get(`${baseURL}/echo`);
+      expect(middlewareCalled).toBe(true);
+    });
+
+    it('should allow middleware to modify config headers', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+
+      instance.useMiddleware('add-header', async (ctx, next) => {
+        ctx.config.headers = {
+          ...ctx.config.headers,
+          'X-Middleware-Header': 'injected',
+        };
+        await next();
+      });
+
+      const res = await instance.get<EchoData>(`${baseURL}/echo`);
+      expect(res.data.headers['x-middleware-header']).toBe('injected');
+    });
+
+    it('should allow middleware to access response', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+
+      let capturedStatus: number | undefined;
+      instance.useMiddleware('capture', async (ctx, next) => {
+        await next();
+        capturedStatus = ctx.response?.status;
+      });
+
+      await instance.get(`${baseURL}/echo`);
+      expect(capturedStatus).toBe(200);
+    });
+
+    it('should remove middleware by name', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+
+      let called = false;
+      instance.useMiddleware('removable', async (ctx, next) => {
+        called = true;
+        await next();
+      });
+
+      instance.removeMiddleware('removable');
+      await instance.get(`${baseURL}/echo`);
+      expect(called).toBe(false);
+    });
+
+    it('should clear all middleware', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+
+      let count = 0;
+      instance.useMiddleware(async (ctx, next) => { count++; await next(); });
+      instance.useMiddleware(async (ctx, next) => { count++; await next(); });
+      instance.clearMiddleware();
+
+      await instance.get(`${baseURL}/echo`);
+      expect(count).toBe(0);
+    });
+
+    it('should allow middleware to set metadata', async () => {
+      const instance = bridge.create({
+        baseURL,
+        allowPrivateNetworks: true,
+      });
+
+      let metadataValue: unknown;
+      instance.useMiddleware('set-meta', async (ctx, next) => {
+        ctx.metadata.startTime = Date.now();
+        await next();
+        metadataValue = ctx.metadata.startTime;
+      });
+
+      await instance.get(`${baseURL}/echo`);
+      expect(typeof metadataValue).toBe('number');
+    });
+  });
+
+  // ─── v7.0.0 Proxy Support ───────────────────────────────────────────────
+
+  describe('proxy support', () => {
+    it('should export shouldBypassProxy', () => {
+      const { shouldBypassProxy } = require('../src/proxy');
+      expect(shouldBypassProxy('example.com', undefined)).toBe(false);
+      expect(shouldBypassProxy('example.com', ['*'])).toBe(true);
+      expect(shouldBypassProxy('example.com', ['example.com'])).toBe(true);
+      expect(shouldBypassProxy('sub.example.com', ['*.example.com'])).toBe(true);
+      expect(shouldBypassProxy('example.com', ['*.example.com'])).toBe(true);
+      expect(shouldBypassProxy('other.com', ['*.example.com'])).toBe(false);
+      expect(shouldBypassProxy('example.com', [])).toBe(false);
+    });
+
+    it('should bypass proxy for noProxy hosts', () => {
+      const { shouldBypassProxy } = require('../src/proxy');
+      expect(shouldBypassProxy('internal.company.com', ['*.company.com', 'localhost'])).toBe(true);
+      expect(shouldBypassProxy('localhost', ['*.company.com', 'localhost'])).toBe(true);
+      expect(shouldBypassProxy('external.com', ['*.company.com', 'localhost'])).toBe(false);
+    });
+  });
+
+  // ─── v7.0.0 HTTP/2 ──────────────────────────────────────────────────────
+
+  describe('HTTP2SessionManager', () => {
+    it('should be constructable', () => {
+      const { HTTP2SessionManager } = require('../src/http2');
+      const manager = new HTTP2SessionManager({ enabled: true });
+      expect(manager.activeSessions).toBe(0);
+    });
+
+    it('should close all sessions', () => {
+      const { HTTP2SessionManager } = require('../src/http2');
+      const manager = new HTTP2SessionManager({ enabled: true });
+      manager.closeAll();
+      expect(manager.activeSessions).toBe(0);
+    });
+
+    it('should resolve config correctly', () => {
+      const { resolveHTTP2Config } = require('../src/http2');
+      expect(resolveHTTP2Config(undefined)).toBeNull();
+      expect(resolveHTTP2Config(false)).toBeNull();
+      expect(resolveHTTP2Config(true)).toEqual({
+        enabled: true,
+        sessionTimeout: 60000,
+        maxConcurrentStreams: 100,
+        reuseSessions: true,
+      });
+      expect(resolveHTTP2Config({ enabled: true, sessionTimeout: 30000 })).toEqual({
+        enabled: true,
+        sessionTimeout: 30000,
+        maxConcurrentStreams: 100,
+        reuseSessions: true,
+      });
+      expect(resolveHTTP2Config({ enabled: false })).toBeNull();
+    });
+  });
+
+  // ─── v7.0.0 DNS Cache Config Resolution ──────────────────────────────────
+
+  describe('DNS cache config resolution', () => {
+    it('should resolve config correctly', () => {
+      const { resolveDNSCacheConfig } = require('../src/dns-cache');
+      expect(resolveDNSCacheConfig(undefined)).toBeNull();
+      expect(resolveDNSCacheConfig(false)).toBeNull();
+      expect(resolveDNSCacheConfig(true)).toEqual({ ttl: 30000, maxSize: 256 });
+      expect(resolveDNSCacheConfig({ ttl: 5000 })).toEqual({ ttl: 5000, maxSize: 256 });
+    });
+  });
+
+  // ─── v7.0.0 Cookie Jar Config Resolution ─────────────────────────────────
+
+  describe('cookie jar config resolution', () => {
+    it('should resolve config correctly', () => {
+      const { resolveCookieJarConfig } = require('../src/cookie');
+      expect(resolveCookieJarConfig(undefined)).toBeNull();
+      expect(resolveCookieJarConfig(false)).toBeNull();
+      expect(resolveCookieJarConfig(true)).toEqual({ maxCookies: 1000, secureOnly: false });
+      expect(resolveCookieJarConfig({ maxCookies: 500 })).toEqual({ maxCookies: 500, secureOnly: false });
+    });
+  });
+
+  // ─── v7.0.0 Exports ─────────────────────────────────────────────────────
+
+  describe('v7.0.0 exports', () => {
+    it('should export DNSCache', () => {
+      const { DNSCache } = require('../src');
+      expect(DNSCache).toBeDefined();
+      expect(typeof DNSCache).toBe('function');
+    });
+
+    it('should export CookieJar', () => {
+      const { CookieJar } = require('../src');
+      expect(CookieJar).toBeDefined();
+      expect(typeof CookieJar).toBe('function');
+    });
+
+    it('should export MiddlewarePipeline', () => {
+      const { MiddlewarePipeline } = require('../src');
+      expect(MiddlewarePipeline).toBeDefined();
+      expect(typeof MiddlewarePipeline).toBe('function');
+    });
+
+    it('should export HTTP2SessionManager', () => {
+      const { HTTP2SessionManager } = require('../src');
+      expect(HTTP2SessionManager).toBeDefined();
+      expect(typeof HTTP2SessionManager).toBe('function');
+    });
+
+    it('should have v7.0.0 instance methods', () => {
+      expect(typeof bridge.setDNSCache).toBe('function');
+      expect(typeof bridge.clearDNSCache).toBe('function');
+      expect(typeof bridge.setCookieJar).toBe('function');
+      expect(typeof bridge.clearCookies).toBe('function');
+      expect(typeof bridge.useMiddleware).toBe('function');
+      expect(typeof bridge.removeMiddleware).toBe('function');
+      expect(typeof bridge.clearMiddleware).toBe('function');
+      expect(typeof bridge.closeHTTP2Sessions).toBe('function');
     });
   });
 });

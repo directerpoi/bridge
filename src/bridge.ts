@@ -8,11 +8,16 @@ import { ConcurrencyManager, resolveConcurrencyConfig } from './concurrency';
 import { ResponseCache, resolveCacheConfig, CacheConfig } from './cache';
 import { RequestDeduplicator } from './dedup';
 import { createError } from './error';
+import { DNSCache, resolveDNSCacheConfig, DNSCacheConfig } from './dns-cache';
+import { CookieJar, resolveCookieJarConfig, CookieJarConfig } from './cookie';
+import { MiddlewarePipeline, MiddlewareFunction, MiddlewareContext } from './middleware';
+import { HTTP2SessionManager, resolveHTTP2Config } from './http2';
 
 /**
  * The Bridge HTTP client class.
  * API-compatible with axios — supports interceptors, defaults, and convenience methods.
  * v4.0.0: Adds rate limiting, circuit breaker, concurrency control, progress events, timeline, and hooks.
+ * v7.0.0: Adds HTTP/2, proxy, cookie jar, DNS caching, and middleware pipeline.
  */
 export class Bridge {
   defaults: BridgeRequestConfig;
@@ -26,6 +31,10 @@ export class Bridge {
   private concurrencyManager: ConcurrencyManager | null = null;
   private responseCache: ResponseCache | null = null;
   private deduplicator: RequestDeduplicator | null = null;
+  private dnsCache: DNSCache | null = null;
+  private cookieJar: CookieJar | null = null;
+  private middlewarePipeline: MiddlewarePipeline = new MiddlewarePipeline();
+  private http2Manager: HTTP2SessionManager | null = null;
 
   constructor(instanceConfig: BridgeRequestConfig = {}) {
     this.defaults = instanceConfig;
@@ -102,9 +111,90 @@ export class Bridge {
     }
   }
 
+  // ─── v7.0.0 Instance Methods ──────────────────────────────────────────────
+
+  /**
+   * Enable or disable DNS caching.
+   */
+  setDNSCache(config: boolean | Partial<DNSCacheConfig>): void {
+    if (config === false) {
+      this.dnsCache = null;
+      return;
+    }
+    const resolved = resolveDNSCacheConfig(config);
+    this.dnsCache = resolved ? new DNSCache(resolved) : null;
+  }
+
+  /**
+   * Clear the DNS cache.
+   */
+  clearDNSCache(): void {
+    if (this.dnsCache) {
+      this.dnsCache.clear();
+    }
+  }
+
+  /**
+   * Enable or disable the cookie jar.
+   */
+  setCookieJar(config: boolean | Partial<CookieJarConfig>): void {
+    if (config === false) {
+      this.cookieJar = null;
+      return;
+    }
+    const resolved = resolveCookieJarConfig(config);
+    this.cookieJar = resolved ? new CookieJar(resolved) : null;
+  }
+
+  /**
+   * Clear all cookies.
+   */
+  clearCookies(): void {
+    if (this.cookieJar) {
+      this.cookieJar.clear();
+    }
+  }
+
+  /**
+   * Add a middleware to the pipeline.
+   */
+  useMiddleware(handler: MiddlewareFunction): void;
+  useMiddleware(name: string, handler: MiddlewareFunction): void;
+  useMiddleware(nameOrHandler: string | MiddlewareFunction, handler?: MiddlewareFunction): void {
+    if (typeof nameOrHandler === 'string') {
+      this.middlewarePipeline.use(nameOrHandler, handler!);
+    } else {
+      this.middlewarePipeline.use(nameOrHandler);
+    }
+  }
+
+  /**
+   * Remove a middleware by name.
+   */
+  removeMiddleware(name: string): boolean {
+    return this.middlewarePipeline.remove(name);
+  }
+
+  /**
+   * Clear all middleware.
+   */
+  clearMiddleware(): void {
+    this.middlewarePipeline.clear();
+  }
+
+  /**
+   * Close all HTTP/2 sessions.
+   */
+  closeHTTP2Sessions(): void {
+    if (this.http2Manager) {
+      this.http2Manager.closeAll();
+    }
+  }
+
   /**
    * The main request method. All convenience methods route here.
-   * Integrates rate limiting, circuit breaker, concurrency control, caching, and deduplication.
+   * Integrates rate limiting, circuit breaker, concurrency control, caching, deduplication,
+   * cookie jar, DNS cache, middleware, and HTTP/2.
    */
   async request<T = unknown>(
     configOrUrl: string | BridgeRequestConfig,
@@ -144,6 +234,32 @@ export class Bridge {
       await this.rateLimiter.acquire(finalConfig.signal);
     }
 
+    // v7.0.0: Cookie jar — inject Cookie header before request
+    if (this.cookieJar) {
+      try {
+        const urlObj = new URL(fullURL);
+        const cookieHeader = this.cookieJar.getCookieHeader(
+          urlObj.hostname,
+          urlObj.pathname,
+          urlObj.protocol === 'https:'
+        );
+        if (cookieHeader) {
+          finalConfig = mergeConfig(finalConfig, {
+            headers: { Cookie: cookieHeader },
+          });
+        }
+      } catch {
+        // Ignore URL parse errors; will be caught later in adapter
+      }
+    }
+
+    // v7.0.0: Pass DNS cache and HTTP/2 manager via internal config
+    const internalConfig = {
+      ...finalConfig,
+      _dnsCache: this.dnsCache,
+      _http2Manager: this.http2Manager,
+    } as BridgeRequestConfig & { _dnsCache?: DNSCache; _http2Manager?: HTTP2SessionManager };
+
     // Wrap the actual execution for concurrency control
     const executeInternal = async (): Promise<BridgeResponse<T>> => {
       // Run request interceptors (in order)
@@ -152,7 +268,7 @@ export class Bridge {
         requestInterceptors.push(handler);
       });
 
-      let currentConfig = finalConfig;
+      let currentConfig = internalConfig as BridgeRequestConfig;
       for (const interceptor of requestInterceptors) {
         try {
           currentConfig = await interceptor.fulfilled(currentConfig);
@@ -165,74 +281,118 @@ export class Bridge {
         }
       }
 
-      // Execute the request
-      let response: BridgeResponse<T>;
-      try {
-        response = (await httpAdapter(currentConfig)) as BridgeResponse<T>;
-      } catch (err) {
-        // Record failure in circuit breaker
-        if (this.circuitBreaker) {
-          this.circuitBreaker.recordFailure();
+      // v7.0.0: Middleware pipeline wrapping
+      const coreRequest = async (): Promise<BridgeResponse<T>> => {
+        // Execute the request
+        let response: BridgeResponse<T>;
+        try {
+          response = (await httpAdapter(currentConfig)) as BridgeResponse<T>;
+        } catch (err) {
+          // Record failure in circuit breaker
+          if (this.circuitBreaker) {
+            this.circuitBreaker.recordFailure();
+          }
+
+          // Run response interceptors' rejected handlers on error
+          const responseInterceptors: InterceptorHandler<BridgeResponse>[] = [];
+          this.interceptors.response.forEach((handler) => {
+            responseInterceptors.push(handler);
+          });
+
+          let caughtError: unknown = err;
+          for (const interceptor of responseInterceptors) {
+            if (interceptor.rejected) {
+              try {
+                const result = await interceptor.rejected(caughtError);
+                // If the rejected handler returns a response, treat it as resolved
+                if (result && typeof result === 'object' && 'status' in result) {
+                  return result as BridgeResponse<T>;
+                }
+                caughtError = result;
+              } catch (e) {
+                caughtError = e;
+              }
+            }
+          }
+          throw caughtError;
         }
 
-        // Run response interceptors' rejected handlers on error
+        // Record success in circuit breaker
+        if (this.circuitBreaker) {
+          this.circuitBreaker.recordSuccess();
+        }
+
+        // v7.0.0: Cookie jar — extract Set-Cookie from response
+        if (this.cookieJar && response.headers) {
+          try {
+            const urlObj = new URL(fullURL);
+            // Set-Cookie headers may be combined with commas by Node.js
+            // We need to handle both single and multiple Set-Cookie values
+            const setCookie = response.headers['set-cookie'];
+            if (setCookie) {
+              // If the adapter stored raw headers, they'd be joined by ', '
+              // but Set-Cookie can contain commas in dates, so we split carefully
+              const cookies = setCookie.split(/,\s*(?=[A-Za-z0-9_\-]+=)/);
+              this.cookieJar.setCookies(cookies, urlObj.hostname, urlObj.pathname);
+            }
+          } catch {
+            // Ignore cookie parsing errors
+          }
+        }
+
+        // Run response interceptors (in order)
         const responseInterceptors: InterceptorHandler<BridgeResponse>[] = [];
         this.interceptors.response.forEach((handler) => {
           responseInterceptors.push(handler);
         });
 
-        let caughtError: unknown = err;
+        let currentResponse: BridgeResponse = response;
         for (const interceptor of responseInterceptors) {
-          if (interceptor.rejected) {
-            try {
-              const result = await interceptor.rejected(caughtError);
-              // If the rejected handler returns a response, treat it as resolved
+          try {
+            currentResponse = await interceptor.fulfilled(currentResponse);
+          } catch (err) {
+            if (interceptor.rejected) {
+              const result = await interceptor.rejected(err);
               if (result && typeof result === 'object' && 'status' in result) {
-                return result as BridgeResponse<T>;
+                currentResponse = result as BridgeResponse;
               }
-              caughtError = result;
-            } catch (e) {
-              caughtError = e;
+            } else {
+              throw err;
             }
           }
         }
-        throw caughtError;
-      }
 
-      // Record success in circuit breaker
-      if (this.circuitBreaker) {
-        this.circuitBreaker.recordSuccess();
-      }
-
-      // Run response interceptors (in order)
-      const responseInterceptors: InterceptorHandler<BridgeResponse>[] = [];
-      this.interceptors.response.forEach((handler) => {
-        responseInterceptors.push(handler);
-      });
-
-      let currentResponse: BridgeResponse = response;
-      for (const interceptor of responseInterceptors) {
-        try {
-          currentResponse = await interceptor.fulfilled(currentResponse);
-        } catch (err) {
-          if (interceptor.rejected) {
-            const result = await interceptor.rejected(err);
-            if (result && typeof result === 'object' && 'status' in result) {
-              currentResponse = result as BridgeResponse;
-            }
-          } else {
-            throw err;
-          }
+        // v6.0.0: Cache the response
+        if (this.responseCache && this.responseCache.isCacheableMethod(method)) {
+          const cacheKey = ResponseCache.key(method, fullURL);
+          this.responseCache.set(cacheKey, currentResponse);
         }
+
+        return currentResponse as BridgeResponse<T>;
+      };
+
+      // v7.0.0: Execute through middleware pipeline if any middleware are registered
+      if (this.middlewarePipeline.length > 0) {
+        const ctx: MiddlewareContext = {
+          config: currentConfig,
+          metadata: {},
+        };
+
+        let result: BridgeResponse<T> | undefined;
+        await this.middlewarePipeline.execute(ctx, async (mwCtx) => {
+          // Core handler: update config from context (middleware may have modified it)
+          currentConfig = mwCtx.config;
+          result = await coreRequest();
+          mwCtx.response = result;
+        });
+
+        if (result) return result;
+        // If middleware short-circuited and set a response
+        if (ctx.response) return ctx.response as BridgeResponse<T>;
+        throw createError('Middleware pipeline did not produce a response', currentConfig, 'ERR_MIDDLEWARE');
       }
 
-      // v6.0.0: Cache the response
-      if (this.responseCache && this.responseCache.isCacheableMethod(method)) {
-        const cacheKey = ResponseCache.key(method, fullURL);
-        this.responseCache.set(cacheKey, currentResponse);
-      }
-
-      return currentResponse as BridgeResponse<T>;
+      return coreRequest();
     };
 
     // v6.0.0: Wrap with deduplication if enabled
