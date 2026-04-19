@@ -79,6 +79,9 @@ export interface CircuitBreakerConfig {
   halfOpenRequests: number;
   /** Optional callback when circuit state changes */
   onStateChange?: (from: CircuitState, to: CircuitState) => void;
+  /** Optional fallback function invoked when the circuit is open.
+   *  Return a BridgeResponse to gracefully degrade instead of throwing. */
+  fallback?: (error: Error) => BridgeResponse | Promise<BridgeResponse>;
 }
 
 // ─── Concurrency Types ─────────────────────────────────────────────────────────
@@ -86,6 +89,9 @@ export interface CircuitBreakerConfig {
 export interface ConcurrencyConfig {
   /** Maximum number of concurrent requests (default: 10) */
   maxConcurrent: number;
+  /** Maximum time in ms a request can wait in the concurrency queue before being rejected (default: 0 = no limit).
+   *  Prevents indefinite queuing in worst-case overload scenarios. */
+  queueTimeout?: number;
 }
 
 // ─── Progress Types ────────────────────────────────────────────────────────────
@@ -174,6 +180,19 @@ export interface BridgeRequestConfig {
   proxy?: ProxyConfig | false;
   /** Enable HTTP/2 for HTTPS requests. Pass true for defaults or an HTTP2Config object. */
   http2?: boolean | Partial<HTTP2Config>;
+
+  // ─── v9.0.0 Resilience Features ─────────────────────────────────────────────
+
+  /** Total timeout in ms covering the entire request lifecycle including all retries.
+   *  Unlike `timeout` (which covers a single request attempt), this caps the total wall-clock time.
+   *  Prevents unbounded retry loops in worst-case scenarios. */
+  totalTimeout?: number;
+  /** Fallback function invoked when all retries are exhausted, the circuit breaker is open,
+   *  or a total timeout fires. Return a BridgeResponse to gracefully degrade instead of throwing. */
+  fallback?: (error: Error) => BridgeResponse | Promise<BridgeResponse>;
+  /** Priority for concurrency queue ordering. Higher values are processed first (default: 0).
+   *  Use to ensure critical requests are prioritized in worst-case load. */
+  priority?: number;
 
   // ─── v8.0.0 Security Features ──────────────────────────────────────────────
 
