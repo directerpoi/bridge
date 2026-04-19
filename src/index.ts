@@ -7,6 +7,10 @@ import { ConcurrencyManager } from './concurrency';
 import { ResponseCache } from './cache';
 import { RequestDeduplicator } from './dedup';
 import { signRequest, verifySignature } from './signing';
+import { DNSCache } from './dns-cache';
+import { CookieJar } from './cookie';
+import { MiddlewarePipeline } from './middleware';
+import { HTTP2SessionManager } from './http2';
 import {
   BridgeRequestConfig,
   BridgeResponse,
@@ -29,13 +33,18 @@ import type { RequestTimeline } from './timeline';
 import type { CircuitState } from './circuit-breaker';
 import type { CacheConfig } from './cache';
 import type { RequestSigningConfig } from './signing';
+import type { DNSCacheConfig } from './dns-cache';
+import type { CookieJarConfig } from './cookie';
+import type { ProxyConfig } from './proxy';
+import type { HTTP2Config } from './http2';
+import type { MiddlewareFunction, MiddlewareContext } from './middleware';
 
 // ─── Create Default Instance ───────────────────────────────────────────────────
 
 const bridge = createBridgeInstance({
   headers: {
     'Accept': 'application/json, text/plain, */*',
-    'User-Agent': 'bridge/6.0.0',
+    'User-Agent': 'bridge/7.0.0',
   },
   timeout: 0,
   responseType: 'json',
@@ -77,6 +86,10 @@ export { ConcurrencyManager };
 export { ResponseCache };
 export { RequestDeduplicator };
 export { signRequest, verifySignature };
+export { DNSCache };
+export { CookieJar };
+export { MiddlewarePipeline };
+export { HTTP2SessionManager };
 
 // Re-export types
 export type {
@@ -100,6 +113,12 @@ export type {
   CircuitState,
   CacheConfig,
   RequestSigningConfig,
+  DNSCacheConfig,
+  CookieJarConfig,
+  ProxyConfig,
+  HTTP2Config,
+  MiddlewareFunction,
+  MiddlewareContext,
 };
 
 // CommonJS compatibility
@@ -120,3 +139,7 @@ module.exports.ResponseCache = ResponseCache;
 module.exports.RequestDeduplicator = RequestDeduplicator;
 module.exports.signRequest = signRequest;
 module.exports.verifySignature = verifySignature;
+module.exports.DNSCache = DNSCache;
+module.exports.CookieJar = CookieJar;
+module.exports.MiddlewarePipeline = MiddlewarePipeline;
+module.exports.HTTP2SessionManager = HTTP2SessionManager;

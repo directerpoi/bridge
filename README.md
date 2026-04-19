@@ -22,6 +22,14 @@ Bridge is a zero-dependency HTTP client with an axios-compatible API. Drop-in re
 - **🔒 HTTPS Enforcement** — option to reject all non-HTTPS requests
 - **📝 TypeScript** — full type definitions included
 
+### v7.0.0 — Maximum Power
+
+- **🌐 HTTP/2 Support** — multiplexed streams over a single connection, session pooling, automatic protocol negotiation via Node.js built-in `http2` module
+- **🔗 Proxy Support** — HTTP CONNECT tunneling for HTTPS through HTTP proxies, proxy authentication, noProxy bypass lists
+- **🍪 Cookie Jar** — automatic cookie management across requests with domain/path scoping, Secure/HttpOnly flag support, expiration via Max-Age/Expires
+- **🏎️ DNS Caching** — in-memory DNS resolution cache with configurable TTL and LRU eviction for faster repeat requests
+- **🔧 Middleware Pipeline** — composable onion-model middleware chain for custom request/response processing (like Koa)
+
 ### v5.0.0 — Enhanced Security
 
 - **🛡️ Domain Allowlist** — restrict requests to approved domains only, with wildcard subdomain support

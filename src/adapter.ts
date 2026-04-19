@@ -11,6 +11,8 @@ import { buildFullURL } from './utils';
 import { resolveRetryConfig, shouldRetry, calculateDelay, sleep } from './retry';
 import { createTimeline, finalizeTimeline, RequestTimeline } from './timeline';
 import { signRequest } from './signing';
+import { shouldBypassProxy, createProxyTunnel, buildProxyRequestOptions, ProxyConfig } from './proxy';
+import { DNSCache } from './dns-cache';
 
 // ─── Default Config ────────────────────────────────────────────────────────────
 
@@ -260,6 +262,11 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
     const startRequest = (resolvedIP?: string) => {
       const isHttps = parsedURL.protocol === 'https:';
       const transport = isHttps ? https : http;
+
+      // v7.0.0: Proxy support
+      const proxyConfig = configWithId.proxy;
+      const useProxy = proxyConfig && typeof proxyConfig === 'object' &&
+        !shouldBypassProxy(parsedURL.hostname, proxyConfig.noProxy);
 
       const requestOptions: http.RequestOptions & https.RequestOptions = {
         hostname: resolvedIP || parsedURL.hostname,
@@ -782,7 +789,41 @@ function executeRequest(config: BridgeRequestConfig): Promise<BridgeResponse> {
         }
       }
 
-      doRequest(requestOptions, parsedURL);
+      // v7.0.0: If using a proxy, set up tunneling for HTTPS or direct proxying for HTTP
+      if (useProxy && proxyConfig) {
+        if (isHttps) {
+          // HTTPS through proxy: use CONNECT tunneling
+          const targetHost = parsedURL.hostname;
+          const targetPort = parseInt(parsedURL.port || '443', 10);
+          createProxyTunnel(proxyConfig, targetHost, targetPort)
+            .then((tunnelSocket) => {
+              // Use the tunnel socket as the connection
+              (requestOptions as Record<string, unknown>).socket = tunnelSocket;
+              requestOptions.hostname = targetHost;
+              doRequest(requestOptions, parsedURL);
+            })
+            .catch((err) => {
+              const error = createError(
+                (err as Error).message,
+                configWithId,
+                'ERR_PROXY_CONNECT_FAILED'
+              );
+              if (config.hooks?.onError) config.hooks.onError(error);
+              reject(error);
+            });
+        } else {
+          // HTTP through proxy: send full URL as path
+          const proxyOptions = buildProxyRequestOptions(
+            proxyConfig,
+            fullURL,
+            method,
+            requestOptions.headers as Record<string, string>
+          );
+          doRequest(proxyOptions, parsedURL);
+        }
+      } else {
+        doRequest(requestOptions, parsedURL);
+      }
     };
 
     // Execute with optional DNS protection

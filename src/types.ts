@@ -4,6 +4,11 @@ import type { RequestTimeline } from './timeline';
 import type { CircuitState } from './circuit-breaker';
 import type { RequestSigningConfig } from './signing';
 import type { CacheConfig } from './cache';
+import type { ProxyConfig } from './proxy';
+import type { DNSCacheConfig } from './dns-cache';
+import type { CookieJarConfig } from './cookie';
+import type { HTTP2Config } from './http2';
+import type { MiddlewareFunction } from './middleware';
 
 export type Method =
   | 'get' | 'GET'
@@ -163,6 +168,13 @@ export interface BridgeRequestConfig {
   /** Respect Retry-After headers from server responses during retry (default: true when retry is enabled) */
   respectRetryAfter?: boolean;
 
+  // ─── v7.0.0 Features ──────────────────────────────────────────────────────
+
+  /** HTTP proxy configuration for tunneling requests through a proxy server. */
+  proxy?: ProxyConfig | false;
+  /** Enable HTTP/2 for HTTPS requests. Pass true for defaults or an HTTP2Config object. */
+  http2?: boolean | Partial<HTTP2Config>;
+
   // Retry options
   /** Enable automatic retry with exponential backoff. Pass true for defaults or a RetryConfig. */
   retry?: boolean | Partial<RetryConfig>;
@@ -276,6 +288,25 @@ export interface BridgeInstance {
   clearCache(): void;
   /** Enable or disable request deduplication. */
   setDeduplication(enabled: boolean): void;
+
+  // ─── v7.0.0 Instance Methods ─────────────────────────────────────────────
+  /** Enable or disable DNS caching. Pass true for defaults or a DNSCacheConfig object. */
+  setDNSCache(config: boolean | Partial<DNSCacheConfig>): void;
+  /** Clear the DNS cache. */
+  clearDNSCache(): void;
+  /** Enable or disable the cookie jar. Pass true for defaults or a CookieJarConfig object. */
+  setCookieJar(config: boolean | Partial<CookieJarConfig>): void;
+  /** Clear all cookies. */
+  clearCookies(): void;
+  /** Add a middleware to the pipeline. */
+  useMiddleware(handler: MiddlewareFunction): void;
+  useMiddleware(name: string, handler: MiddlewareFunction): void;
+  /** Remove a middleware by name. */
+  removeMiddleware(name: string): boolean;
+  /** Clear all middleware. */
+  clearMiddleware(): void;
+  /** Close all HTTP/2 sessions. */
+  closeHTTP2Sessions(): void;
 }
 
 export interface InterceptorManager<V> {
@@ -314,6 +345,25 @@ export interface BridgeStatic extends BridgeInstance {
   clearCache(): void;
   /** Enable or disable request deduplication. */
   setDeduplication(enabled: boolean): void;
+
+  // ─── v7.0.0 Instance Methods ─────────────────────────────────────────────
+  /** Enable or disable DNS caching. */
+  setDNSCache(config: boolean | Partial<DNSCacheConfig>): void;
+  /** Clear the DNS cache. */
+  clearDNSCache(): void;
+  /** Enable or disable the cookie jar. */
+  setCookieJar(config: boolean | Partial<CookieJarConfig>): void;
+  /** Clear all cookies. */
+  clearCookies(): void;
+  /** Add a middleware to the pipeline. */
+  useMiddleware(handler: MiddlewareFunction): void;
+  useMiddleware(name: string, handler: MiddlewareFunction): void;
+  /** Remove a middleware by name. */
+  removeMiddleware(name: string): boolean;
+  /** Clear all middleware. */
+  clearMiddleware(): void;
+  /** Close all HTTP/2 sessions. */
+  closeHTTP2Sessions(): void;
 }
 
 export interface CancelTokenStatic {
